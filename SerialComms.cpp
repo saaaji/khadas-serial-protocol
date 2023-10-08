@@ -2,8 +2,8 @@
 
 SerialComms::SerialComms(const char *port_name, const speed_t& baud_rate) 
 {
-    this->port = open(port_name, O_RDWR);
-    this->baud_rate = baud_rate;
+    // attempt to open the serial port
+    port = open(port_name, O_RDWR);
 
     // check if Teensy is connected
     if (port < 0) {
@@ -46,7 +46,10 @@ SerialComms::SerialComms(const char *port_name, const speed_t& baud_rate)
 
 SerialComms::~SerialComms() 
 {
-    close(this->port);
+    // attempt to close the serial port
+    if (close(this->port) < 0) {
+        log_err("close", "Teensy may be disconnected");
+    }
 }
 
 void SerialComms::log_err(const std::string& func_name, const std::string& msg)
@@ -60,6 +63,7 @@ void SerialComms::log_err(const std::string& func_name, const std::string& msg)
 
 int SerialComms::stage_byte(uint8_t byte)
 {
+    // check to make sure we don't write off the end of the buffer
     if (write_buffer_offset < WRITE_BUFFER_MAX_SIZE) {
         write_buffer[write_buffer_offset++] = byte;
         return 0;
@@ -69,9 +73,11 @@ int SerialComms::stage_byte(uint8_t byte)
 
 int SerialComms::stage_uint(uint64_t u64, int size)
 {
+    // if requesting 1 byte, just stage it directly
     if (size == 1) {
         return stage_byte((uint8_t) u64);
     } else {
+        // serialize integer into respective bytes in little endian order
         for (int i = 0; i < size; i++) {
             uint8_t byte = (u64 >> i * 8) & 0xFF;
             if (stage_byte(byte) < 0) {
@@ -84,27 +90,32 @@ int SerialComms::stage_uint(uint64_t u64, int size)
 
 void SerialComms::stage_header(uint16_t length)
 {
-    stage_byte(0xa5);
+    // stage all components of header
+    stage_byte(START_BYTE);
     stage_uint(length, 2);
     stage_byte(seq);
 
+    // update packet sequence number if must wrap around
     if (seq == 255) {
         seq = 0;
     } else {
         seq++;
     }
 
+    // TODO: implement crc8
     stage_byte(0);
 }
 
 void SerialComms::stage_footer()
 {
+    // TODO: implement crc16
     stage_byte(0);
     stage_byte(0);
 }
 
 void SerialComms::send_packet(uint16_t cmd_id, uint8_t *data, uint16_t length)
 {
+    // stage all components of packet
     stage_header(length);
     stage_uint(cmd_id, 2);
 
@@ -121,7 +132,7 @@ void SerialComms::send_packet(uint16_t cmd_id, uint8_t *data, uint16_t length)
 
 int SerialComms::read_byte()
 {
-    // what to do when empty and it keeps trying to read?
+    // if we are at the end of the read buffer, overwrite from beginning
     if (read_buffer_offset == read_buffer_current_size) {
         int result = read(port, read_buffer, READ_BUFFER_MAX_SIZE);
 
@@ -158,9 +169,11 @@ int SerialComms::read_bytes(uint8_t *data, int count)
 
 uint64_t SerialComms::decode_uint(int offset, int size, uint8_t *data)
 {
+    // if we just want 1 byte, pull from array directly
     if (size == 1) {
         return data[offset];
     } else {
+        // must assemble integer from bytes in little endian order
         uint64_t result = 0;
         for (int i = 0; i < size; i++) {
             uint8_t byte = data[offset + i];
@@ -179,11 +192,15 @@ SerialPacket SerialComms::read_packet()
 {
     int byte;
     uint8_t temp[4];
+
+    // try to pull bytes from the stream until a start byte is encountered
     while ((byte = read_byte()) >= 0) {
         if (byte == START_BYTE) {
 #ifdef DEBUG_PACKETS
             printf("\n[ATTEMPTING PACKET READ]\n");
 #endif
+
+            // read the packet header
             if (read_bytes(temp, 4) < 4) {
                 break;
             }
@@ -202,6 +219,7 @@ SerialPacket SerialComms::read_packet()
             }
             prev_seq = seq;
 
+            // read the packet data section
             if (read_bytes(temp, 2) < 2) {
                 break;
             }
@@ -213,6 +231,7 @@ SerialPacket SerialComms::read_packet()
                 break;
             }
 
+            // read the packet footer
             if (read_bytes(temp, 2) < 2) {
                 break;
             }

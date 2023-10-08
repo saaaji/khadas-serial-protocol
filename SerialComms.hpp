@@ -9,11 +9,12 @@
 #include <errno.h>
 #include <cstring>
 
-#define DEBUG_PACKETS
-#define READ_BUFFER_MAX_SIZE 1024
-#define WRITE_BUFFER_MAX_SIZE 1024
-#define START_BYTE 0xA5
+#define DEBUG_PACKETS // log packet debug data
+#define READ_BUFFER_MAX_SIZE 1024 // max size (in bytes) of the read buffer
+#define WRITE_BUFFER_MAX_SIZE 1024 // max size (in bytes) of the write buffer
+#define START_BYTE 0xA5 // start byte of packet
 
+/// @brief Simple struct to store packet data
 struct SerialPacket {
     uint16_t cmd_id;
     struct {
@@ -22,10 +23,10 @@ struct SerialPacket {
     } dr16;
 };
 
+/// @brief Exposes basic functions for sending and receiving packets from the Teensy
 class SerialComms {
     private:
         int port;
-        speed_t baud_rate;
         uint8_t seq = 0;
         uint8_t prev_seq = 0;
         SerialPacket packet;
