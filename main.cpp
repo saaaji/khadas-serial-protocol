@@ -1,4 +1,5 @@
 #include "SerialComms.hpp"
+#include <cstring>
 
 uint32_t bit_cast(float f) {
     uint32_t target;
@@ -24,6 +25,8 @@ int main() {
         float dr16_floats[5] = {0.1, 0.2, 0.3, 0.4, 0.5};
         uint32_t dr16_ints[2] = {1, 2};
 
+        SerialPacket packet;
+
         for (int i = 0; i < 5; i++) {
             uint32_t u32 = bit_cast(dr16_floats[i]);
             dr16_data[i * 4 + 0] = u32 & 0xFF;
@@ -42,8 +45,8 @@ int main() {
         }
         
         serial_comms.send_packet(0x0103, dr16_data, 28);
-        // sleep(1);
-        serial_comms.read_packet();
+        sleep(1);
+        serial_comms.read_packet(packet);
     }
     
     return 0;

@@ -1,5 +1,4 @@
 import serial
-import crcmod
 import struct
 import sys
 
@@ -34,10 +33,6 @@ def create_packet_header(data_length: int):
 
 def main():
     print('[SERIAL PROTOCOL TESTING]', end='\n\n')
-    
-    crc8 = crcmod.Crc(0xFF)
-
-    # print(crc8(create_packet_header(10)));
 
     test_physical = len(sys.argv) > 1 and sys.argv[1] == 'test-phys'
 

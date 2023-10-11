@@ -13,15 +13,15 @@ SerialComms::SerialComms(const char *port_name, const speed_t& baud_rate)
         struct termios tty;
 
         if (tcgetattr(port, &tty) < 0) {
-            log_err("tcgetattr", "");
+            log_err("tcgetattr");
         }
         
         if (cfsetospeed(&tty, baud_rate) < 0) {
-            log_err("cfsetospeed", "");
+            log_err("cfsetospeed");
         }
 
         if (cfsetispeed(&tty, baud_rate) < 0) {
-            log_err("cfsetispeed", "");
+            log_err("cfsetispeed");
         }
 
         // setting "raw mode" attributes according to man7.org/linux/man-pages/man3/termios3.html
@@ -39,7 +39,7 @@ SerialComms::SerialComms(const char *port_name, const speed_t& baud_rate)
         tty.c_cc[VTIME] = 0;
         
         if (tcsetattr(port, TCSANOW, &tty) < 0) {
-            log_err("tcsetattr", "");
+            log_err("tcsetattr");
         }
     }
 }
@@ -54,33 +54,48 @@ SerialComms::~SerialComms()
 
 void SerialComms::log_err(const std::string& func_name, const std::string& msg)
 {
-    if (msg != "") {
-        std::cerr << "\"" << func_name << "\"" << " call failed (" << msg << "): errno = " << errno << std::endl;
-    } else {
-        std::cerr << "\"" << func_name << "\"" << " call failed: errno = " << errno << std::endl;
-    }
+    std::cerr << "\"" << func_name << "\"" << " call failed (" << msg << "): errno = " << errno << std::endl;
 }
 
-int SerialComms::stage_byte(uint8_t byte)
+void SerialComms::log_err(const std::string& func_name)
+{
+    std::cerr << "\"" << func_name << "\"" << " call failed: errno = " << errno << std::endl;
+}
+
+int SerialComms::flush_write_buffer()
+{
+    if (write(port, write_buffer, write_buffer_offset) < 0) {
+        log_err("write");
+        return -1;
+    }
+    write_buffer_offset = 0;
+    return 0;
+}
+
+int SerialComms::write_byte(uint8_t byte)
 {
     // check to make sure we don't write off the end of the buffer
-    if (write_buffer_offset < WRITE_BUFFER_MAX_SIZE) {
-        write_buffer[write_buffer_offset++] = byte;
-        return 0;
+    if (write_buffer_offset >= WRITE_BUFFER_MAX_SIZE) {
+        if (flush_write_buffer() < 0) {
+            log_err("flush_write_buffer");
+            return -1;
+        }
     }
-    return -1;
+    
+    write_buffer[write_buffer_offset++] = byte;
+    return 0;
 }
 
-int SerialComms::stage_uint(uint64_t u64, int size)
+int SerialComms::write_uint(uint64_t u64, int size)
 {
     // if requesting 1 byte, just stage it directly
     if (size == 1) {
-        return stage_byte((uint8_t) u64);
+        return write_byte((uint8_t) u64);
     } else {
         // serialize integer into respective bytes in little endian order
         for (int i = 0; i < size; i++) {
             uint8_t byte = (u64 >> i * 8) & 0xFF;
-            if (stage_byte(byte) < 0) {
+            if (write_byte(byte) < 0) {
                 return -1;
             }
         }
@@ -88,12 +103,12 @@ int SerialComms::stage_uint(uint64_t u64, int size)
     }
 }
 
-void SerialComms::stage_header(uint16_t length)
+void SerialComms::write_header(uint16_t length)
 {
     // stage all components of header
-    stage_byte(START_BYTE);
-    stage_uint(length, 2);
-    stage_byte(seq);
+    write_byte(START_BYTE);
+    write_uint(length, 2);
+    write_byte(seq);
 
     // update packet sequence number if must wrap around
     if (seq == 255) {
@@ -103,31 +118,28 @@ void SerialComms::stage_header(uint16_t length)
     }
 
     // TODO: implement crc8
-    stage_byte(0);
+    write_byte(0);
 }
 
-void SerialComms::stage_footer()
+void SerialComms::write_footer()
 {
     // TODO: implement crc16
-    stage_byte(0);
-    stage_byte(0);
+    write_byte(0);
+    write_byte(0);
 }
 
 void SerialComms::send_packet(uint16_t cmd_id, uint8_t *data, uint16_t length)
 {
     // stage all components of packet
-    stage_header(length);
-    stage_uint(cmd_id, 2);
+    write_header(length);
+    write_uint(cmd_id, 2);
 
     for (int i = 0; i < length; i++) {
-        stage_byte(data[i]);
+        write_byte(data[i]);
     }
 
-    stage_footer();
-
-    if (write(port, write_buffer, write_buffer_offset) < 0) {
-        log_err("write", "");
-    }
+    write_footer();
+    flush_write_buffer();
 }
 
 int SerialComms::read_byte()
@@ -140,7 +152,7 @@ int SerialComms::read_byte()
             read_buffer_current_size = result; 
             read_buffer_offset = 0;
         } else {
-            log_err("read", "");
+            log_err("read");
             read_buffer_current_size = 0;
             read_buffer_offset = 0;
         }
@@ -188,7 +200,7 @@ uint16_t SerialComms::decode_short(int offset, uint8_t *data)
     return static_cast<uint16_t>(decode_uint(offset, 2, data));
 }
 
-SerialPacket SerialComms::read_packet()
+int SerialComms::read_packet(SerialPacket& packet)
 {
     int byte;
     uint8_t temp[4];
@@ -209,9 +221,9 @@ SerialPacket SerialComms::read_packet()
             uint8_t seq = temp[2];
             uint8_t crc8 = temp[3];
 
-#ifdef DEBUG_PACKETS
+            #ifdef DEBUG_PACKETS
             printf("\tpacket sequence num = %u\n", seq);
-#endif
+            #endif
 
             // check for dropped packet
             if (seq - prev_seq > 1) {
@@ -272,7 +284,7 @@ SerialPacket SerialComms::read_packet()
                     packet.dr16.l_switch = uint32_arr[0];
                     packet.dr16.r_switch = uint32_arr[1];
 
-#ifdef DEBUG_PACKETS
+                    #ifdef DEBUG_PACKETS
                     printf(
                         "\tdr16 packet data (%#02x):\n\
 \t\tl_stick_x: %f\n\
@@ -291,7 +303,8 @@ SerialPacket SerialComms::read_packet()
                         packet.dr16.l_switch,
                         packet.dr16.r_switch
                     );
-#endif
+                    #endif
+                    
                     break;
                 case 0x0104: // rev encoder
                     break;
@@ -304,6 +317,12 @@ SerialPacket SerialComms::read_packet()
                 case 0x0202: // client draw command
                     break;
             }
+
+            // successful packet read
+            return 0;
         }
     }
+    
+    // while loop broke, packet was not found
+    return -1;
 }
