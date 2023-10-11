@@ -16,10 +16,19 @@ constexpr int START_BYTE = 0xA5; // start byte of packet
 /// @brief Simple struct to store packet data
 struct SerialPacket {
     uint16_t cmd_id;
+    
     struct {
         float l_stick_x, l_stick_y, r_stick_x, r_stick_y, wheel;
         uint32_t l_switch, r_switch;
     } dr16;
+
+    struct {
+        float angle;
+    } rev_encoder;
+
+    struct {
+        float psi, theta, phi;
+    } ism;
 };
 
 /// @brief Exposes basic functions for sending and receiving packets from the Teensy

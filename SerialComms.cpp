@@ -208,9 +208,9 @@ int SerialComms::read_packet(SerialPacket& packet)
     // try to pull bytes from the stream until a start byte is encountered
     while ((byte = read_byte()) >= 0) {
         if (byte == START_BYTE) {
-#ifdef DEBUG_PACKETS
+            #ifdef DEBUG_PACKETS
             printf("\n[ATTEMPTING PACKET READ]\n");
-#endif
+            #endif
 
             // read the packet header
             if (read_bytes(temp, 4) < 4) {
@@ -253,7 +253,12 @@ int SerialComms::read_packet(SerialPacket& packet)
             // utility arrays for decoding packet data
             float float_arr[16] = {0.0};
             uint32_t uint32_arr[16] {0};
+            union {
+                uint32_t u32;
+                float f32;
+            } bitcaster;
 
+            packet.cmd_id = cmd_id;
             switch (cmd_id) {
                 // sensors and estimators
                 case 0x0101: // estimator state
@@ -261,11 +266,6 @@ int SerialComms::read_packet(SerialPacket& packet)
                 case 0x0102: // motor feedback
                     break;
                 case 0x0103: // DR16 data
-                    union {
-                        uint32_t u32;
-                        float f32;
-                    } bitcaster;
-
                     for (int i = 0; i < 5; i++) {
                         bitcaster.u32 = static_cast<uint32_t>(decode_uint(i * 4, 4, data));
                         float_arr[i] = bitcaster.f32;
@@ -275,7 +275,6 @@ int SerialComms::read_packet(SerialPacket& packet)
                         uint32_arr[i] = static_cast<uint32_t>(decode_uint(20 + i * 4, 4, data));
                     }
 
-                    packet.cmd_id = cmd_id;
                     packet.dr16.l_stick_x = float_arr[0];
                     packet.dr16.l_stick_y = float_arr[1];
                     packet.dr16.r_stick_x = float_arr[2];
@@ -286,14 +285,14 @@ int SerialComms::read_packet(SerialPacket& packet)
 
                     #ifdef DEBUG_PACKETS
                     printf(
-                        "\tdr16 packet data (%#02x):\n\
-\t\tl_stick_x: %f\n\
-\t\tl_stick_y: %f\n\
-\t\tr_stick_x: %f\n\
-\t\tr_stick_y: %f\n\
-\t\twheel: %f\n\
-\t\tl_switch: %u\n\
-\t\tr_switch: %u\n",
+                        "\tdr16 packet data (%#02x):\n"
+                        "\t\tl_stick_x: %f\n"
+                        "\t\tl_stick_y: %f\n"
+                        "\t\tr_stick_x: %f\n"
+                        "\t\tr_stick_y: %f\n"
+                        "\t\twheel: %f\n"
+                        "\t\tl_switch: %u\n"
+                        "\t\tr_switch: %u\n",
                         packet.cmd_id,
                         packet.dr16.l_stick_x,
                         packet.dr16.l_stick_y,
@@ -307,8 +306,42 @@ int SerialComms::read_packet(SerialPacket& packet)
                     
                     break;
                 case 0x0104: // rev encoder
+                    bitcaster.u32 = static_cast<uint32_t>(decode_uint(0, 4, data));
+                    packet.rev_encoder.angle = bitcaster.f32;
+
+                    #ifdef DEBUG_PACKETS
+                    printf(
+                        "\tRev Encoder packet data (%#02x):\n"
+                        "\t\tangle: %f\n",
+                        packet.cmd_id,
+                        packet.rev_encoder.angle
+                    );
+                    #endif
+
                     break;
                 case 0x0105: // ISM
+                    for (int i = 0; i < 3; i++) {
+                        bitcaster.u32 = static_cast<uint32_t>(decode_uint(i * 4, 4, data));
+                        float_arr[i] = bitcaster.f32;
+                    }
+
+                    packet.ism.psi = float_arr[0];
+                    packet.ism.theta = float_arr[1];
+                    packet.ism.phi = float_arr[2];
+
+                    #ifdef DEBUG_PACKETS
+                    printf(
+                        "\tISM packet data (%#02x):\n"
+                        "\t\tpsi: %f\n"
+                        "\t\tpsi: %f\n"
+                        "\t\tpsi: %f\n",
+                        packet.cmd_id,
+                        packet.ism.psi,
+                        packet.ism.theta,
+                        packet.ism.phi
+                    );
+                    #endif
+
                     break;
 
                 // referee system
