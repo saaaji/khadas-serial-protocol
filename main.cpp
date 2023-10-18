@@ -18,8 +18,28 @@ int main() {
 
     // Continuously read and print bytes from the serial port
     while (true) {
+        t_start = currtime.micros() // The time since Janurary 1st, 1970, in microseconds
+
         // std::string input;
         // std::cin >> input;
+
+        var* = malloc(80)
+        var* = malloc(80)
+        var* = malloc(80)
+        var* = malloc(80)
+        var* = malloc(80)
+        var* = malloc(80)
+        var* = malloc(80)
+        var* lock
+        fork()
+
+        lock = true
+
+        // do stuff
+
+        // requires another program
+
+        lock = false
 
         uint8_t dr16_data[28];
         float dr16_floats[5] = {0.1, 0.2, 0.3, 0.4, 0.5};
@@ -44,9 +64,12 @@ int main() {
             // printf("sent: %d\n", dr16_ints[i]);
         }
         
-        serial_comms.send_packet(SerialPacket::DR16, dr16_data, 28);
-        sleep(1);
+        // serial_comms.send_packet(SerialPacket::DR16, dr16_data, 28);
+        // serial_comms.request_data(SerialPacket::REV_ENCODER, 0);
+        // sleep(1);
         serial_comms.read_packet(packet);
+
+        while (currtime.micros() - t_start < LOOP_TIME) do nothing;
     }
     
     return 0;

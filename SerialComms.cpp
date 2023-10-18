@@ -279,6 +279,7 @@ int SerialComms::read_packet(SerialPacket& packet)
 
             #ifdef DEBUG_PACKETS
             printf("\tpacket sequence num = %u\n", seq);
+            printf("\tdata_length = %u\n", data_length);
             printf("\treceived crc8 = %u\n", crc8);
             printf("\tcalculated crc8 = %u\n", calc_crc8);
             #endif
@@ -378,7 +379,7 @@ int SerialComms::read_packet(SerialPacket& packet)
                         "\tRev Encoder packet data (%#02x):\n"
                         "\t\tangle: %f\n",
                         packet.cmd_id,
-                        packet.rev_encoder.angle
+                        packet.rev_encoder.angle * 180/3.14159
                     );
                     #endif
 
