@@ -18,8 +18,8 @@ int main() {
 
     // Continuously read and print bytes from the serial port
     while (true) {
-        std::string input;
-        std::cin >> input;
+        // std::string input;
+        // std::cin >> input;
 
         uint8_t dr16_data[28];
         float dr16_floats[5] = {0.1, 0.2, 0.3, 0.4, 0.5};
@@ -44,7 +44,7 @@ int main() {
             // printf("sent: %d\n", dr16_ints[i]);
         }
         
-        serial_comms.send_packet(0x0103, dr16_data, 28);
+        serial_comms.send_packet(SerialPacket::DR16, dr16_data, 28);
         sleep(1);
         serial_comms.read_packet(packet);
     }

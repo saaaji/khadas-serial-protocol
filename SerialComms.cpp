@@ -62,6 +62,26 @@ void SerialComms::log_err(const std::string& func_name)
     std::cerr << "\"" << func_name << "\"" << " call failed: errno = " << errno << std::endl;
 }
 
+uint8_t SerialComms::generate_crc8(const uint8_t *data, int size)
+{
+    uint8_t crc8 = 0xFF;
+    for (int i = 0; i < size; i++) {
+        uint8_t n = crc8 ^ data[i];
+        crc8 = CRC8_LOOKUP[n];
+    }
+    return crc8;
+}
+
+uint16_t SerialComms::generate_crc16(const uint8_t *data, int size)
+{
+    uint16_t crc16 = 0xFFFF;
+    for (int i = 0; i < size; i++) {
+        uint8_t n = data[i];
+        crc16 = (crc16 >> 8) ^ CRC16_LOOKUP[(crc16 ^ static_cast<uint16_t>(n)) & 0x00FF];
+    }
+    return crc16;
+}
+
 int SerialComms::flush_write_buffer()
 {
     if (write(port, write_buffer, write_buffer_offset) < 0) {
@@ -118,21 +138,20 @@ void SerialComms::write_header(uint16_t length)
     }
 
     // TODO: implement crc8
-    write_byte(0);
+    write_byte(generate_crc8(write_buffer, write_buffer_offset));
 }
 
 void SerialComms::write_footer()
 {
-    // TODO: implement crc16
-    write_byte(0);
-    write_byte(0);
+    uint16_t crc16 = generate_crc16(write_buffer, write_buffer_offset);
+    write_uint(crc16, 2);
 }
 
-void SerialComms::send_packet(uint16_t cmd_id, uint8_t *data, uint16_t length)
+void SerialComms::send_packet(SerialPacket::CommandID cmd_id, uint8_t *data, uint16_t length)
 {
     // stage all components of packet
     write_header(length);
-    write_uint(cmd_id, 2);
+    write_uint((uint16_t) cmd_id, 2);
 
     for (int i = 0; i < length; i++) {
         write_byte(data[i]);
@@ -140,6 +159,18 @@ void SerialComms::send_packet(uint16_t cmd_id, uint8_t *data, uint16_t length)
 
     write_footer();
     flush_write_buffer();
+}
+
+// send DATA_REQUEST
+void SerialComms::request_data(SerialPacket::CommandID cmd_id, uint8_t sensor_id)
+{
+    uint8_t data[3];
+    
+    data[0] = (uint16_t) cmd_id & 0xFF;
+    data[1] = (uint16_t) cmd_id >> 8;
+    data[2] = sensor_id;
+
+    send_packet(SerialPacket::DATA_REQUEST, data, 3);
 }
 
 int SerialComms::read_byte()
@@ -221,10 +252,6 @@ int SerialComms::read_packet(SerialPacket& packet)
             uint8_t seq = temp[2];
             uint8_t crc8 = temp[3];
 
-            #ifdef DEBUG_PACKETS
-            printf("\tpacket sequence num = %u\n", seq);
-            #endif
-
             // check for dropped packet
             if (seq - prev_seq > 1) {
                 std::cerr << "packet dropped" << std::endl;
@@ -237,7 +264,31 @@ int SerialComms::read_packet(SerialPacket& packet)
             }
 
             uint16_t cmd_id = decode_short(0, temp);
-            uint8_t data[data_length];
+            uint8_t packet_bytes[7 + data_length];
+            
+            packet_bytes[0] = START_BYTE;
+            packet_bytes[1] = data_length & 0xFF;
+            packet_bytes[2] = data_length >> 8;
+            packet_bytes[3] = seq;
+            packet_bytes[4] = crc8;
+            packet_bytes[5] = cmd_id & 0xFF;
+            packet_bytes[6] = cmd_id >> 8;
+
+            uint8_t *data = &packet_bytes[7];
+            uint8_t calc_crc8 = generate_crc8(packet_bytes, 4);
+
+            #ifdef DEBUG_PACKETS
+            printf("\tpacket sequence num = %u\n", seq);
+            printf("\treceived crc8 = %u\n", crc8);
+            printf("\tcalculated crc8 = %u\n", calc_crc8);
+            #endif
+
+            #ifdef CHECK_CRC
+            if (crc8 != calc_crc8) {
+                std::cerr << "CRC8 checksums do not match" << std::endl;
+                break;
+            }
+            #endif
             
             if (read_bytes(data, data_length) < data_length) {
                 break;
@@ -249,6 +300,19 @@ int SerialComms::read_packet(SerialPacket& packet)
             }
 
             uint16_t crc16 = decode_short(0, temp);
+            uint16_t calc_crc16 = generate_crc16(packet_bytes, 7 + data_length);
+            
+            #ifdef DEBUG_PACKETS
+            printf("\treceived crc16 = %u\n", crc16);
+            printf("\tcalculated crc16 = %u\n", calc_crc16);
+            #endif
+            
+            #ifdef CHECK_CRC
+            if (crc16 != calc_crc16) {
+                std::cerr << "CRC16 checksums do not match" << std::endl;
+                break;
+            }
+            #endif
 
             // utility arrays for decoding packet data
             float float_arr[16] = {0.0};
@@ -258,14 +322,14 @@ int SerialComms::read_packet(SerialPacket& packet)
                 float f32;
             } bitcaster;
 
-            packet.cmd_id = cmd_id;
+            packet.cmd_id = static_cast<SerialPacket::CommandID>(cmd_id);
             switch (cmd_id) {
                 // sensors and estimators
                 case 0x0101: // estimator state
                     break;
                 case 0x0102: // motor feedback
                     break;
-                case 0x0103: // DR16 data
+                case SerialPacket::DR16: // DR16 data
                     for (int i = 0; i < 5; i++) {
                         bitcaster.u32 = static_cast<uint32_t>(decode_uint(i * 4, 4, data));
                         float_arr[i] = bitcaster.f32;
@@ -305,7 +369,7 @@ int SerialComms::read_packet(SerialPacket& packet)
                     #endif
                     
                     break;
-                case 0x0104: // rev encoder
+                case SerialPacket::REV_ENCODER: // rev encoder
                     bitcaster.u32 = static_cast<uint32_t>(decode_uint(0, 4, data));
                     packet.rev_encoder.angle = bitcaster.f32;
 
@@ -319,7 +383,7 @@ int SerialComms::read_packet(SerialPacket& packet)
                     #endif
 
                     break;
-                case 0x0105: // ISM
+                case SerialPacket::ISM: // ISM
                     for (int i = 0; i < 3; i++) {
                         bitcaster.u32 = static_cast<uint32_t>(decode_uint(i * 4, 4, data));
                         float_arr[i] = bitcaster.f32;
