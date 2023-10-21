@@ -1,16 +1,18 @@
 #include "SerialComms.hpp"
-#include <cstring>
 
 uint32_t bit_cast(float f) {
-    uint32_t target;
-    std::memcpy(&target, &f, sizeof(float));
-    return target;
+  union {
+    float f32;
+    uint32_t u32;
+  } caster;
+  caster.f32 = f;
+  return caster.u32;
 }
 
 //for linux machine
 int main() {
-    const char *port_name = "/dev/ttyACM0"; // Update with your serial port name
-    const speed_t baud_rate = B9600;         // Adjust the baud rate as needed
+    const char *port_name = "/dev/ttyACM1"; // Update with your serial port name
+    const speed_t baud_rate = B9600;        // Adjust the baud rate as needed
 
     SerialComms serial_comms(port_name, baud_rate);
 
@@ -18,29 +20,6 @@ int main() {
 
     // Continuously read and print bytes from the serial port
     while (true) {
-        t_start = currtime.micros() // The time since Janurary 1st, 1970, in microseconds
-
-        // std::string input;
-        // std::cin >> input;
-
-        var* = malloc(80)
-        var* = malloc(80)
-        var* = malloc(80)
-        var* = malloc(80)
-        var* = malloc(80)
-        var* = malloc(80)
-        var* = malloc(80)
-        var* lock
-        fork()
-
-        lock = true
-
-        // do stuff
-
-        // requires another program
-
-        lock = false
-
         uint8_t dr16_data[28];
         float dr16_floats[5] = {0.1, 0.2, 0.3, 0.4, 0.5};
         uint32_t dr16_ints[2] = {1, 2};
@@ -64,12 +43,10 @@ int main() {
             // printf("sent: %d\n", dr16_ints[i]);
         }
         
-        // serial_comms.send_packet(SerialPacket::DR16, dr16_data, 28);
+        serial_comms.send_packet(SerialPacket::DR16, dr16_data, 28);
         // serial_comms.request_data(SerialPacket::REV_ENCODER, 0);
-        // sleep(1);
+        sleep(1);
         serial_comms.read_packet(packet);
-
-        while (currtime.micros() - t_start < LOOP_TIME) do nothing;
     }
     
     return 0;

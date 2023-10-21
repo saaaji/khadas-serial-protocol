@@ -2,7 +2,7 @@ import serial
 import struct
 import sys
 
-PORT = 'COM3'
+PORT = 'ttyACM0'
 BAUDRATE = 10000
 TIMEOUT = 0.1
 

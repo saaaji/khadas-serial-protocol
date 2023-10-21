@@ -274,6 +274,7 @@ int SerialComms::read_packet(SerialPacket& packet)
             packet_bytes[5] = cmd_id & 0xFF;
             packet_bytes[6] = cmd_id >> 8;
 
+            // data segment starts on the 7th byte.
             uint8_t *data = &packet_bytes[7];
             uint8_t calc_crc8 = generate_crc8(packet_bytes, 4);
 
