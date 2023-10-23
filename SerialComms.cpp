@@ -1,6 +1,6 @@
 #include "SerialComms.hpp"
 
-SerialComms::SerialComms(const char *port_name, const speed_t& baud_rate) 
+SerialComms::SerialComms(const char *port_name) 
 {
     // attempt to open the serial port
     port = open(port_name, O_RDWR);
@@ -11,18 +11,66 @@ SerialComms::SerialComms(const char *port_name, const speed_t& baud_rate)
     } else {
         // Configure the serial port settings
         struct termios tty;
+        struct serial_struct serial;
 
         if (tcgetattr(port, &tty) < 0) {
             log_err("tcgetattr");
         }
+
+        #ifdef CUSTOM_BAUD
+        #ifdef DEBUG_PACKETS
+        fprintf(stderr, "configuring custom baud (%dbps)\n", USB_BAUD);
+        #endif
+
+        // on linux custom baud must be set through baud rate aliasing
+        serial.reserved_char[0] = 0;
         
-        if (cfsetospeed(&tty, baud_rate) < 0) {
+        if (ioctl(port, TIOCGSERIAL, &serial) < 0) {
+            log_err("ioctl[TIOCGSERIAL]");
+        }
+
+        serial.flags &= ~ASYNC_SPD_MASK;
+        serial.flags |= ASYNC_SPD_CUST;
+        serial.custom_divisor = (serial.baud_base + (USB_BAUD / 2)) / USB_BAUD;
+        
+        if (serial.custom_divisor < 1) {
+            serial.custom_divisor = 1;
+        }
+
+        if (ioctl(port, TIOCSSERIAL, &serial) < 0) {
+            log_err("ioctl[TIOCSSERIAL]");
+        }
+
+        if (ioctl(port, TIOCGSERIAL, &serial) < 0) {
+            log_err("iotcl[TIOCSSERIAL]");
+        }
+
+        if (serial.custom_divisor * USB_BAUD != serial.baud_base) {
+            warnx("actual baudrate is %d / %d = %f",
+                  serial.baud_base, serial.custom_divisor,
+                  (float) serial.baud_base / serial.custom_divisor);
+        }
+
+        if (cfsetospeed(&tty, B38400) < 0) {
             log_err("cfsetospeed");
         }
 
-        if (cfsetispeed(&tty, baud_rate) < 0) {
+        if (cfsetispeed(&tty, B38400) < 0) {
             log_err("cfsetispeed");
         }
+
+        #else // B<rate>
+
+        // if baud rate is one of the B<rate> constants
+        if (cfsetospeed(&tty, FALLBACK_BAUD) < 0) {
+            log_err("cfsetospeed");
+        }
+
+        if (cfsetispeed(&tty, FALLBACK_BAUD) < 0) {
+            log_err("cfsetispeed");
+        }
+        
+        #endif
 
         // setting "raw mode" attributes according to man7.org/linux/man-pages/man3/termios3.html
         tty.c_cflag |= (CLOCAL | CREAD);
@@ -52,14 +100,14 @@ SerialComms::~SerialComms()
     }
 }
 
-void SerialComms::log_err(const std::string& func_name, const std::string& msg)
+void SerialComms::log_err(const char* func_name, const char* msg)
 {
-    std::cerr << "\"" << func_name << "\"" << " call failed (" << msg << "): errno = " << errno << std::endl;
+    fprintf(stderr, "\"%s\" call failed (%s): errno = %d\n", func_name, msg, errno);
 }
 
-void SerialComms::log_err(const std::string& func_name)
+void SerialComms::log_err(const char* func_name)
 {
-    std::cerr << "\"" << func_name << "\"" << " call failed: errno = " << errno << std::endl;
+    fprintf(stderr, "\"%s\" call failed: errno = %d\n", func_name, errno);
 }
 
 uint8_t SerialComms::generate_crc8(const uint8_t *data, int size)
@@ -254,7 +302,7 @@ int SerialComms::read_packet(SerialPacket& packet)
 
             // check for dropped packet
             if (seq - prev_seq > 1) {
-                std::cerr << "packet dropped" << std::endl;
+              fprintf(stderr, "packet dropped\n");
             }
             prev_seq = seq;
 
@@ -287,7 +335,7 @@ int SerialComms::read_packet(SerialPacket& packet)
 
             #ifdef CHECK_CRC
             if (crc8 != calc_crc8) {
-                std::cerr << "CRC8 checksums do not match" << std::endl;
+                fprintf("CRC8 checksums do not match\n");
                 break;
             }
             #endif
@@ -311,7 +359,7 @@ int SerialComms::read_packet(SerialPacket& packet)
             
             #ifdef CHECK_CRC
             if (crc16 != calc_crc16) {
-                std::cerr << "CRC16 checksums do not match" << std::endl;
+                fprintf("CRC8 checksums do not match\n");
                 break;
             }
             #endif

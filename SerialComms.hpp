@@ -1,18 +1,25 @@
 #ifndef SERIAL_COMMS
 #define SERIAL_COMMS
 
-#include <iostream>
-#include <fcntl.h>
+#include <cstdio> //
+#include <cstdint> // integer types
+#include <fcntl.h> // file IO
 #include <unistd.h>
 #include <termios.h>
 #include <errno.h>
+#include <err.h>
+#include <sys/ioctl.h>
+#include <linux/serial.h>
 
-#define DEBUG_PACKETS // log packet debug data
-// #define CHECK_CRC // checksums
-
+constexpr speed_t FALLBACK_BAUD = B115200;
+constexpr int USB_BAUD = 480000000; // 480 Mbps over USB serial
 constexpr int READ_BUFFER_MAX_SIZE = 1024; // max size (in bytes) of the read buffer
 constexpr int WRITE_BUFFER_MAX_SIZE = 1024; // max size (in bytes) of the write buffer
 constexpr int START_BYTE = 0xA5; // start byte of packet
+
+#define DEBUG_PACKETS // log packet debug data
+// #define CHECK_CRC // checksums
+#define CUSTOM_BAUD
 
 const uint8_t CRC8_LOOKUP[256] = {
     0x00, 0x5e, 0xbc, 0xe2, 0x61, 0x3f, 0xdd, 0x83, 0xc2, 0x9c, 0x7e, 0x20, 0xa3, 0xfd, 0x1f, 0x41,
@@ -80,6 +87,64 @@ struct SerialPacket {
     struct {
         float psi, theta, phi;
     } ism;
+};
+
+struct SerialRequest {
+    SerialPacket::CommandID cmd_id;
+    uint8_t sensor_id = 0;
+    SerialRequest *next_req = nullptr;
+
+    SerialRequest(SerialPacket::CommandID cmd_id): cmd_id{cmd_id} {}
+    SerialRequest(SerialPacket::CommandID cmd_id, uint8_t sensor_id)
+        : cmd_id{cmd_id}
+        , sensor_id{sensor_id}
+    {}
+};
+
+class SerialRequestQueue {
+    private:
+        SerialRequest *head;
+        SerialRequest *tail;
+    
+    public:
+        SerialRequestQueue() 
+            : head{nullptr}
+            , tail{nullptr}
+        {}
+
+        ~SerialRequestQueue() {
+            while (head) {
+                deq_request();
+            }
+        }
+
+        void enq_request(SerialPacket::CommandID cmd_id) {
+            if (head && tail) {
+                tail->next_req = new SerialRequest(cmd_id);
+                tail = tail->next_req;
+            } else {
+                head = tail = new SerialRequest(cmd_id);
+            }
+        }
+
+        void enq_request(SerialPacket::CommandID cmd_id, uint8_t sensor_id) {
+            if (head && tail) {
+                tail->next_req = new SerialRequest(cmd_id, sensor_id);
+                tail = tail->next_req;
+            } else {
+                head = tail = new SerialRequest(cmd_id, sensor_id);
+            }
+        }
+
+        SerialRequest *peek() {
+            return tail;
+        }
+
+        void deq_request() {
+            SerialRequest *tmp = head;
+            head = head->next_req;
+            delete tmp;
+        }
 };
 
 /// @brief Exposes basic functions for sending and receiving packets from the Teensy
@@ -160,16 +225,16 @@ class SerialComms {
         void write_footer();
 
         /// @brief Log error with message
-        void log_err(const std::string& func_name, const std::string& msg);
+        void log_err(const char* func_name, const char* msg);
         
         /// @brief Log error without message
-        void log_err(const std::string& func_name);
+        void log_err(const char* func_name);
 
         uint8_t generate_crc8(const uint8_t *data, int size);
         uint16_t generate_crc16(const uint8_t *data, int size);
         
     public:
-        SerialComms(const char *port_name, const speed_t& baud_rate);
+        SerialComms(const char *port_name);
         ~SerialComms();
 
         /// @brief Send packet to the Teensy
