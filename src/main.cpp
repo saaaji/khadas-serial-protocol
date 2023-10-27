@@ -1,4 +1,8 @@
 #include "SerialComms.hpp"
+#include <chrono>
+
+// Hz
+#define CYCLE_FREQ_HZ 10
 
 uint32_t bit_cast(float f) {
   union {
@@ -9,38 +13,24 @@ uint32_t bit_cast(float f) {
   return caster.u32;
 }
 
+typedef std::chrono::high_resolution_clock sys_time;
+typedef std::chrono::duration<uint32_t, std::micro> micros;
+
 //for linux machine
 int main() {
     SerialComms serial_comms("/dev/ttyACM0");
+    SerialPacket packet;
 
-    printf("[ARDUINO READBACK]\n");
+    uint32_t cycle_time_us = 1'000'000 / CYCLE_FREQ_HZ;
 
-    // Continuously read and print bytes from the serial port
-    int counter = 0;
-    while (counter++ < 50) {
-        uint8_t dr16_data[28];
-        float dr16_floats[5] = {0.1, 0.2, 0.3, 0.4, 0.5};
-        uint32_t dr16_ints[2] = {1, 2};
+    while (true) {
+        auto start = sys_time::now();
 
-        SerialPacket packet;
-
-        for (int i = 0; i < 5; i++) {
-            uint32_t u32 = bit_cast(dr16_floats[i]);
-            dr16_data[i * 4 + 0] = u32 & 0xFF;
-            dr16_data[i * 4 + 1] = (u32 >> 8) & 0xFF;
-            dr16_data[i * 4 + 2] = (u32 >> 16) & 0xFF;
-            dr16_data[i * 4 + 3] = (u32 >> 24) & 0xFF;
-        }
-
-        for (int i = 0; i < 2; i++) {
-            dr16_data[20 + i * 4 + 0] = dr16_ints[i] & 0xFF;
-            dr16_data[20 + i * 4 + 1] = (dr16_ints[i] >> 8) & 0xFF;
-            dr16_data[20 + i * 4 + 2] = (dr16_ints[i] >> 24) & 0xFF;
-            dr16_data[20 + i * 4 + 3] = (dr16_ints[i] >> 16) & 0xFF;
-        }
-        
-        serial_comms.send_packet(SerialPacket::DR16, dr16_data, 28);
         serial_comms.read_packet(packet);
+
+        while(
+          std::chrono::duration_cast<micros>(sys_time::now() - start).count() < cycle_time_us
+        );
     }
     
     return 0;

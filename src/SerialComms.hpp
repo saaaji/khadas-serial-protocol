@@ -1,14 +1,25 @@
 #ifndef SERIAL_COMMS
 #define SERIAL_COMMS
 
-// running on Linux or Teensy?
+/**
+* DETECT PLATFORM (LINUX/TEENSY4.1)
+*/
 #ifdef __linux__
 #define LINUX
 #endif
 
-#ifdef LINUX
-#include <cstdio> // printf and family
+/**
+* GLOBAL INCLUDES
+*/
 #include <cstdint> // integer types
+
+
+#ifdef LINUX
+
+/**
+* LINUX INCLUDES
+*/
+#include <cstdio> // printf and family
 #include <fcntl.h> // file IO
 #include <unistd.h> // more file IO
 #include <termios.h> // serial config
@@ -16,10 +27,21 @@
 #include <err.h> // more error tracking
 #include <sys/ioctl.h> // baud rate aliasing on Linux
 #include <linux/serial.h> // baud rate aliasing on Linux
+
+#else // TEENSY
+
+/**
+* TEENSY INCLUDES
+*/
+#include <Arduino.h>
+
 #endif
 
 #ifdef LINUX
 
+/**
+* LINUX CUSTOM CONFIG
+*/
 #define DEBUG_PACKETS // log packet debug data
 #define CUSTOM_BAUD // use USB_BAUD rather than FALLBACK_BAUD (when baud rate is nonstandard)
 
@@ -29,20 +51,31 @@
 
 constexpr speed_t FALLBACK_BAUD = B115200;
 
-#else // TEENSY4.1
+#else // TEENSY
 
+/**
+* TEENSY CUSTOM CONFIG
+*/
 // cross platform IO
 #define XWRITE(port, data_ptr, data_len) Serial.write(data_ptr, data_len)
 #define XREAD(port, data_ptr, data_len) Serial.readBytes(data_ptr, data_len)
 
 #endif
 
-// #define CHECK_CRC // checksums
+/**
+* GLOBAL CONFIG
+*/
+#define CHECK_CRC // validate checksums
 
+
+/**
+* CONSTANTS
+*/
 constexpr int USB_BAUD = 480000000; // 480 Mbps over USB serial
 constexpr int READ_BUFFER_MAX_SIZE = 1024; // max size (in bytes) of the read buffer
 constexpr int WRITE_BUFFER_MAX_SIZE = 1024; // max size (in bytes) of the write buffer
 constexpr int START_BYTE = 0xA5; // start byte of packet
+constexpr int FULL_HEADER_SIZE = 7; // frame header + command ID
 
 const uint8_t CRC8_LOOKUP[256] = {
     0x00, 0x5e, 0xbc, 0xe2, 0x61, 0x3f, 0xdd, 0x83, 0xc2, 0x9c, 0x7e, 0x20, 0xa3, 0xfd, 0x1f, 0x41,
@@ -166,6 +199,10 @@ class SerialRequestQueue {
         void deq_request() {
             SerialRequest *tmp = head;
             head = head->next_req;
+            if (head == nullptr) {
+                tail = nullptr;
+            }
+
             delete tmp;
         }
 };

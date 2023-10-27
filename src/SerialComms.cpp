@@ -18,10 +18,11 @@ SerialComms::SerialComms(const char *port_name)
             log_err("tcgetattr");
         }
 
-        #ifdef CUSTOM_BAUD
-        #ifdef DEBUG_PACKETS
-        fprintf(stderr, "configuring custom baud (%dbps)\n", USB_BAUD);
-        #endif
+    #ifdef CUSTOM_BAUD
+
+    #ifdef DEBUG_PACKETS
+        fprintf(stderr, "configuring custom baud (%fMbps)\n", USB_BAUD / 1.0e+6);
+    #endif
 
         // on linux custom baud must be set through baud rate aliasing
         serial.reserved_char[0] = 0;
@@ -60,7 +61,7 @@ SerialComms::SerialComms(const char *port_name)
             log_err("cfsetispeed");
         }
 
-        #else // B<rate>
+    #else // B<rate>
 
         // if baud rate is one of the B<rate> constants
         if (cfsetospeed(&tty, FALLBACK_BAUD) < 0) {
@@ -71,7 +72,7 @@ SerialComms::SerialComms(const char *port_name)
             log_err("cfsetispeed");
         }
         
-        #endif
+    #endif
 
         // setting "raw mode" attributes according to man7.org/linux/man-pages/man3/termios3.html
         tty.c_cflag |= (CLOCAL | CREAD);
@@ -105,7 +106,7 @@ SerialComms::~SerialComms()
     if (close(this->port) < 0) {
         log_err("close", "Teensy may be disconnected");
     }
-#endif
+#endif // no handles to release on teensy
 }
 
 void SerialComms::log_err(const char* func_name, const char* msg)
@@ -306,10 +307,12 @@ int SerialComms::read_packet(SerialPacket& packet)
 
     // try to pull bytes from the stream until a start byte is encountered
     while ((byte = read_byte()) >= 0) {
+        // #if defined(DEBUG)
+
         if (byte == START_BYTE) {
 
         #if defined(DEBUG_PACKETS) && defined(LINUX)
-            printf("\n[ATTEMPTING PACKET READ]\n");
+            fprintf(stderr, "\n[ATTEMPTING PACKET READ]\n");
         #endif
 
             // read the packet header
@@ -324,7 +327,7 @@ int SerialComms::read_packet(SerialPacket& packet)
             // check for dropped packet
             if (seq - prev_seq > 1) {
             #if defined(DEBUG_PACKETS) && defined(LINUX)
-                fprintf(stderr, "packet dropped\n");
+                fprintf(stderr, "\t(!) packet dropped\n");
             #endif
             }
             prev_seq = seq;
@@ -335,7 +338,7 @@ int SerialComms::read_packet(SerialPacket& packet)
             }
 
             uint16_t cmd_id = decode_short(0, temp);
-            uint8_t packet_bytes[7 + data_length];
+            uint8_t packet_bytes[FULL_HEADER_SIZE + data_length];
             
             packet_bytes[0] = START_BYTE;
             packet_bytes[1] = data_length & 0xFF;
@@ -345,21 +348,21 @@ int SerialComms::read_packet(SerialPacket& packet)
             packet_bytes[5] = cmd_id & 0xFF;
             packet_bytes[6] = cmd_id >> 8;
 
-            // data segment starts on the 7th byte.
-            uint8_t *data = &packet_bytes[7];
+            // data segment starts after the header/command ID
+            uint8_t *data = &packet_bytes[FULL_HEADER_SIZE];
             uint8_t calc_crc8 = generate_crc8(packet_bytes, 4);
 
         #if defined(DEBUG_PACKETS) && defined(LINUX)
-            printf("\tpacket sequence num = %u\n", seq);
-            printf("\tdata_length = %u\n", data_length);
-            printf("\treceived crc8 = %u\n", crc8);
-            printf("\tcalculated crc8 = %u\n", calc_crc8);
+            fprintf(stderr, "\tpacket sequence num = %u\n", seq);
+            fprintf(stderr, "\tdata_length = %u\n", data_length);
+            fprintf(stderr, "\treceived crc8 = %u\n", crc8);
+            fprintf(stderr, "\tcalculated crc8 = %u\n", calc_crc8);
         #endif
 
         #ifdef CHECK_CRC
             if (crc8 != calc_crc8) {
             #if defined(DEBUG_PACKETS) && defined(LINUX)
-                fprintf("CRC8 checksums do not match\n");
+                fprintf(stderr, "\t(!) CRC8 checksums do not match\n");
             #endif
 
                 break;
@@ -376,17 +379,17 @@ int SerialComms::read_packet(SerialPacket& packet)
             }
 
             uint16_t crc16 = decode_short(0, temp);
-            uint16_t calc_crc16 = generate_crc16(packet_bytes, 7 + data_length);
+            uint16_t calc_crc16 = generate_crc16(packet_bytes, FULL_HEADER_SIZE + data_length);
             
         #if defined(DEBUG_PACKETS) && defined(LINUX)
-            printf("\treceived crc16 = %u\n", crc16);
-            printf("\tcalculated crc16 = %u\n", calc_crc16);
+            fprintf(stderr, "\treceived crc16 = %u\n", crc16);
+            fprintf(stderr, "\tcalculated crc16 = %u\n", calc_crc16);
         #endif
             
         #ifdef CHECK_CRC
             if (crc16 != calc_crc16) {          
             #if defined(DEBUG_PACKETS) && defined(LINUX)
-                fprintf("CRC8 checksums do not match\n");
+                fprintf(stderr, "\t(!) CRC16 checksums do not match\n");
             #endif
                 
                 break;
@@ -427,7 +430,8 @@ int SerialComms::read_packet(SerialPacket& packet)
                     packet.dr16.r_switch = uint32_arr[1];
 
                 #if defined(DEBUG_PACKETS) && defined(LINUX)
-                    printf(
+                    fprintf(
+                        stderr,
                         "\tdr16 packet data (%#02x):\n"
                         "\t\tl_stick_x: %f\n"
                         "\t\tl_stick_y: %f\n"
@@ -453,7 +457,8 @@ int SerialComms::read_packet(SerialPacket& packet)
                     packet.rev_encoder.angle = bitcaster.f32;
 
                 #if defined(DEBUG_PACKETS) && defined(LINUX)
-                    printf(
+                    fprintf(
+                        stderr,
                         "\tRev Encoder packet data (%#02x):\n"
                         "\t\tangle: %f\n",
                         packet.cmd_id,
@@ -473,7 +478,8 @@ int SerialComms::read_packet(SerialPacket& packet)
                     packet.ism.phi = float_arr[2];
 
                 #if defined(DEBUG_PACKETS) && defined(LINUX)
-                    printf(
+                    fprintf(
+                        stderr,
                         "\tISM packet data (%#02x):\n"
                         "\t\tpsi: %f\n"
                         "\t\tpsi: %f\n"
