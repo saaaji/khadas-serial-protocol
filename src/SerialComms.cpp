@@ -2,6 +2,7 @@
 
 SerialComms::SerialComms(const char *port_name) 
 {
+#ifdef LINUX
     // attempt to open the serial port
     port = open(port_name, O_RDWR);
 
@@ -90,24 +91,35 @@ SerialComms::SerialComms(const char *port_name)
             log_err("tcsetattr");
         }
     }
+#else // TEENSY
+    // baud rate setting is ignored, native 480 Mbps always used
+    port = 0;
+    Serial.begin(USB_BAUD);
+#endif
 }
 
 SerialComms::~SerialComms() 
 {
+#ifdef LINUX
     // attempt to close the serial port
     if (close(this->port) < 0) {
         log_err("close", "Teensy may be disconnected");
     }
+#endif
 }
 
 void SerialComms::log_err(const char* func_name, const char* msg)
 {
+#if defined(LINUX) && defined(DEBUG_PACKETS)
     fprintf(stderr, "\"%s\" call failed (%s): errno = %d\n", func_name, msg, errno);
+#endif // no stdout on teensy
 }
 
 void SerialComms::log_err(const char* func_name)
 {
+#if defined(LINUX) && defined(DEBUG_PACKETS)
     fprintf(stderr, "\"%s\" call failed: errno = %d\n", func_name, errno);
+#endif // no stdout on teensy
 }
 
 uint8_t SerialComms::generate_crc8(const uint8_t *data, int size)
@@ -132,7 +144,7 @@ uint16_t SerialComms::generate_crc16(const uint8_t *data, int size)
 
 int SerialComms::flush_write_buffer()
 {
-    if (write(port, write_buffer, write_buffer_offset) < 0) {
+    if (XWRITE(port, write_buffer, write_buffer_offset) < 0) {
         log_err("write");
         return -1;
     }
@@ -223,6 +235,7 @@ void SerialComms::request_data(SerialPacket::CommandID cmd_id, uint8_t sensor_id
 
 int SerialComms::read_byte()
 {
+#ifdef LINUX
     // if we are at the end of the read buffer, overwrite from beginning
     if (read_buffer_offset == read_buffer_current_size) {
         int result = read(port, read_buffer, READ_BUFFER_MAX_SIZE);
@@ -242,10 +255,14 @@ int SerialComms::read_byte()
     } else {
         return -1;
     }
+#else // TEENSY
+    return Serial.read();
+#endif
 }
 
 int SerialComms::read_bytes(uint8_t *data, int count)
 {
+#ifdef LINUX
     int read_count;
     for (read_count = 0; read_count < count; read_count++) {
         int byte = read_byte();
@@ -256,6 +273,9 @@ int SerialComms::read_bytes(uint8_t *data, int count)
         }
     }
     return read_count;
+#else
+    return Serial.readBytes(data, count);
+#endif
 }
 
 uint64_t SerialComms::decode_uint(int offset, int size, uint8_t *data)
@@ -287,9 +307,10 @@ int SerialComms::read_packet(SerialPacket& packet)
     // try to pull bytes from the stream until a start byte is encountered
     while ((byte = read_byte()) >= 0) {
         if (byte == START_BYTE) {
-            #ifdef DEBUG_PACKETS
+
+        #if defined(DEBUG_PACKETS) && defined(LINUX)
             printf("\n[ATTEMPTING PACKET READ]\n");
-            #endif
+        #endif
 
             // read the packet header
             if (read_bytes(temp, 4) < 4) {
@@ -302,7 +323,9 @@ int SerialComms::read_packet(SerialPacket& packet)
 
             // check for dropped packet
             if (seq - prev_seq > 1) {
-              fprintf(stderr, "packet dropped\n");
+            #if defined(DEBUG_PACKETS) && defined(LINUX)
+                fprintf(stderr, "packet dropped\n");
+            #endif
             }
             prev_seq = seq;
 
@@ -326,20 +349,23 @@ int SerialComms::read_packet(SerialPacket& packet)
             uint8_t *data = &packet_bytes[7];
             uint8_t calc_crc8 = generate_crc8(packet_bytes, 4);
 
-            #ifdef DEBUG_PACKETS
+        #if defined(DEBUG_PACKETS) && defined(LINUX)
             printf("\tpacket sequence num = %u\n", seq);
             printf("\tdata_length = %u\n", data_length);
             printf("\treceived crc8 = %u\n", crc8);
             printf("\tcalculated crc8 = %u\n", calc_crc8);
+        #endif
+
+        #ifdef CHECK_CRC
+            if (crc8 != calc_crc8) {
+            #if defined(DEBUG_PACKETS) && defined(LINUX)
+                fprintf("CRC8 checksums do not match\n");
             #endif
 
-            #ifdef CHECK_CRC
-            if (crc8 != calc_crc8) {
-                fprintf("CRC8 checksums do not match\n");
                 break;
             }
-            #endif
-            
+        #endif
+        
             if (read_bytes(data, data_length) < data_length) {
                 break;
             }
@@ -352,17 +378,20 @@ int SerialComms::read_packet(SerialPacket& packet)
             uint16_t crc16 = decode_short(0, temp);
             uint16_t calc_crc16 = generate_crc16(packet_bytes, 7 + data_length);
             
-            #ifdef DEBUG_PACKETS
+        #if defined(DEBUG_PACKETS) && defined(LINUX)
             printf("\treceived crc16 = %u\n", crc16);
             printf("\tcalculated crc16 = %u\n", calc_crc16);
-            #endif
+        #endif
             
-            #ifdef CHECK_CRC
-            if (crc16 != calc_crc16) {
+        #ifdef CHECK_CRC
+            if (crc16 != calc_crc16) {          
+            #if defined(DEBUG_PACKETS) && defined(LINUX)
                 fprintf("CRC8 checksums do not match\n");
+            #endif
+                
                 break;
             }
-            #endif
+        #endif
 
             // utility arrays for decoding packet data
             float float_arr[16] = {0.0};
@@ -397,7 +426,7 @@ int SerialComms::read_packet(SerialPacket& packet)
                     packet.dr16.l_switch = uint32_arr[0];
                     packet.dr16.r_switch = uint32_arr[1];
 
-                    #ifdef DEBUG_PACKETS
+                #if defined(DEBUG_PACKETS) && defined(LINUX)
                     printf(
                         "\tdr16 packet data (%#02x):\n"
                         "\t\tl_stick_x: %f\n"
@@ -416,21 +445,21 @@ int SerialComms::read_packet(SerialPacket& packet)
                         packet.dr16.l_switch,
                         packet.dr16.r_switch
                     );
-                    #endif
+                #endif
                     
                     break;
                 case SerialPacket::REV_ENCODER: // rev encoder
                     bitcaster.u32 = static_cast<uint32_t>(decode_uint(0, 4, data));
                     packet.rev_encoder.angle = bitcaster.f32;
 
-                    #ifdef DEBUG_PACKETS
+                #if defined(DEBUG_PACKETS) && defined(LINUX)
                     printf(
                         "\tRev Encoder packet data (%#02x):\n"
                         "\t\tangle: %f\n",
                         packet.cmd_id,
                         packet.rev_encoder.angle * 180/3.14159
                     );
-                    #endif
+                #endif
 
                     break;
                 case SerialPacket::ISM: // ISM
@@ -443,7 +472,7 @@ int SerialComms::read_packet(SerialPacket& packet)
                     packet.ism.theta = float_arr[1];
                     packet.ism.phi = float_arr[2];
 
-                    #ifdef DEBUG_PACKETS
+                #if defined(DEBUG_PACKETS) && defined(LINUX)
                     printf(
                         "\tISM packet data (%#02x):\n"
                         "\t\tpsi: %f\n"
@@ -454,7 +483,7 @@ int SerialComms::read_packet(SerialPacket& packet)
                         packet.ism.theta,
                         packet.ism.phi
                     );
-                    #endif
+                #endif
 
                     break;
 

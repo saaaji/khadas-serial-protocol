@@ -1,25 +1,48 @@
 #ifndef SERIAL_COMMS
 #define SERIAL_COMMS
 
-#include <cstdio> //
+// running on Linux or Teensy?
+#ifdef __linux__
+#define LINUX
+#endif
+
+#ifdef LINUX
+#include <cstdio> // printf and family
 #include <cstdint> // integer types
 #include <fcntl.h> // file IO
-#include <unistd.h>
-#include <termios.h>
-#include <errno.h>
-#include <err.h>
-#include <sys/ioctl.h>
-#include <linux/serial.h>
+#include <unistd.h> // more file IO
+#include <termios.h> // serial config
+#include <errno.h> // error tracking
+#include <err.h> // more error tracking
+#include <sys/ioctl.h> // baud rate aliasing on Linux
+#include <linux/serial.h> // baud rate aliasing on Linux
+#endif
+
+#ifdef LINUX
+
+#define DEBUG_PACKETS // log packet debug data
+#define CUSTOM_BAUD // use USB_BAUD rather than FALLBACK_BAUD (when baud rate is nonstandard)
+
+// cross platform IO
+#define XWRITE(port, data_ptr, data_len) write(port, data_ptr, data_len)
+#define XREAD(port, data_ptr, data_len) read(port, data_ptr, data_len)
 
 constexpr speed_t FALLBACK_BAUD = B115200;
+
+#else // TEENSY4.1
+
+// cross platform IO
+#define XWRITE(port, data_ptr, data_len) Serial.write(data_ptr, data_len)
+#define XREAD(port, data_ptr, data_len) Serial.readBytes(data_ptr, data_len)
+
+#endif
+
+// #define CHECK_CRC // checksums
+
 constexpr int USB_BAUD = 480000000; // 480 Mbps over USB serial
 constexpr int READ_BUFFER_MAX_SIZE = 1024; // max size (in bytes) of the read buffer
 constexpr int WRITE_BUFFER_MAX_SIZE = 1024; // max size (in bytes) of the write buffer
 constexpr int START_BYTE = 0xA5; // start byte of packet
-
-#define DEBUG_PACKETS // log packet debug data
-// #define CHECK_CRC // checksums
-#define CUSTOM_BAUD
 
 const uint8_t CRC8_LOOKUP[256] = {
     0x00, 0x5e, 0xbc, 0xe2, 0x61, 0x3f, 0xdd, 0x83, 0xc2, 0x9c, 0x7e, 0x20, 0xa3, 0xfd, 0x1f, 0x41,
