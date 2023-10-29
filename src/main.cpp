@@ -26,6 +26,11 @@ int main() {
     while (true) {
         auto start = sys_time::now();
 
+        serial_comms.enqueue_data_request(SerialPacket::DR16, 0);
+        int res = serial_comms.flush_queue(CYCLE_FREQ_HZ);
+
+        printf("[DEQ: %d]\n", res);
+
         serial_comms.read_packet(packet);
 
         while(

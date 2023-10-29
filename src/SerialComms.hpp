@@ -13,7 +13,6 @@
 */
 #include <cstdint> // integer types
 
-
 #ifdef LINUX
 
 /**
@@ -76,6 +75,8 @@ constexpr int READ_BUFFER_MAX_SIZE = 1024; // max size (in bytes) of the read bu
 constexpr int WRITE_BUFFER_MAX_SIZE = 1024; // max size (in bytes) of the write buffer
 constexpr int START_BYTE = 0xA5; // start byte of packet
 constexpr int FULL_HEADER_SIZE = 7; // frame header + command ID
+constexpr int MAX_SENSOR_ARR_SIZE = 16;
+constexpr int MAX_DATA_SIZE = 1024;
 
 const uint8_t CRC8_LOOKUP[256] = {
     0x00, 0x5e, 0xbc, 0xe2, 0x61, 0x3f, 0xdd, 0x83, 0xc2, 0x9c, 0x7e, 0x20, 0xa3, 0xfd, 0x1f, 0x41,
@@ -131,30 +132,39 @@ struct SerialPacket {
     };
 
     CommandID cmd_id;
+
+    struct {
+        CommandID cmd_id;
+        uint8_t sensor_id;
+    } data_req;
+
     struct {
         float l_stick_x, l_stick_y, r_stick_x, r_stick_y, wheel;
         uint32_t l_switch, r_switch;
-    } dr16;
+    } dr16[MAX_SENSOR_ARR_SIZE];
 
     struct {
         float angle;
-    } rev_encoder;
+    } rev_encoder[MAX_SENSOR_ARR_SIZE];
 
     struct {
         float psi, theta, phi;
-    } ism;
+    } ism[MAX_SENSOR_ARR_SIZE];
+};
+
+struct RawPacket {
+    SerialPacket::CommandID cmd_id;
+    uint8_t data[MAX_DATA_SIZE];
+    int length;
+
+    RawPacket(SerialPacket::CommandID cmd_id): cmd_id{cmd_id} {}
 };
 
 struct SerialRequest {
-    SerialPacket::CommandID cmd_id;
-    uint8_t sensor_id = 0;
+    RawPacket packet;
     SerialRequest *next_req = nullptr;
 
-    SerialRequest(SerialPacket::CommandID cmd_id): cmd_id{cmd_id} {}
-    SerialRequest(SerialPacket::CommandID cmd_id, uint8_t sensor_id)
-        : cmd_id{cmd_id}
-        , sensor_id{sensor_id}
-    {}
+    SerialRequest(RawPacket packet): packet{packet} {}
 };
 
 class SerialRequestQueue {
@@ -174,21 +184,12 @@ class SerialRequestQueue {
             }
         }
 
-        void enq_request(SerialPacket::CommandID cmd_id) {
+        void enq_request(RawPacket packet) {
             if (head && tail) {
-                tail->next_req = new SerialRequest(cmd_id);
+                tail->next_req = new SerialRequest(packet);
                 tail = tail->next_req;
             } else {
-                head = tail = new SerialRequest(cmd_id);
-            }
-        }
-
-        void enq_request(SerialPacket::CommandID cmd_id, uint8_t sensor_id) {
-            if (head && tail) {
-                tail->next_req = new SerialRequest(cmd_id, sensor_id);
-                tail = tail->next_req;
-            } else {
-                head = tail = new SerialRequest(cmd_id, sensor_id);
+                head = tail = new SerialRequest(packet);
             }
         }
 
@@ -197,6 +198,9 @@ class SerialRequestQueue {
         }
 
         void deq_request() {
+            if (empty())
+                return;
+
             SerialRequest *tmp = head;
             head = head->next_req;
             if (head == nullptr) {
@@ -204,6 +208,10 @@ class SerialRequestQueue {
             }
 
             delete tmp;
+        }
+
+        bool empty() {
+            return head == nullptr && tail == nullptr;
         }
 };
 
@@ -224,6 +232,8 @@ class SerialComms {
         int write_buffer_current_size = 0;
         int read_buffer_offset = 0;
         int write_buffer_offset = 0;
+
+        SerialRequestQueue queue;
         
         /// @brief Decodes unsigned-integer value of arbitrary size from byte array
         /// @note Bytes must be arranged in Little-Endian order
@@ -290,6 +300,7 @@ class SerialComms {
         /// @brief Log error without message
         void log_err(const char* func_name);
 
+        int calc_data_response_size(SerialPacket::CommandID cmd_id);
         uint8_t generate_crc8(const uint8_t *data, int size);
         uint16_t generate_crc16(const uint8_t *data, int size);
         
@@ -301,13 +312,23 @@ class SerialComms {
         /// @param cmd_id Command ID of the packet
         /// @param data Pointer to the byte array with packet data
         /// @param length Length of the data section
-        void send_packet(SerialPacket::CommandID cmd_id, uint8_t *data, uint16_t length);
+        void send_packet(const RawPacket &packet);
         
         /// @brief Attempt to read packet from 
         /// @return -1 if unable to detect packet in the stream
-        int read_packet(SerialPacket& packet);
+        bool read_packet(SerialPacket& packet);
 
+        /// @brief enqueue a packet and send
         void request_data(SerialPacket::CommandID cmd_id, uint8_t sensor_id);
+
+        /// @brief enqueue a packet (add SerialRequest to the queue)
+        void enqueue_packet(SerialPacket::CommandID cmd_id, uint8_t *data, uint16_t length);
+
+        /// @brief enqueue data request (KHADAS)
+        void enqueue_data_request(SerialPacket::CommandID cmd_id, uint8_t sensor_id);
+
+        /// @brief send as many packets as possible on this loop iteration
+        int flush_queue(int loop_freq);
 };
 
 #endif

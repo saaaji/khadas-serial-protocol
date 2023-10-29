@@ -2,6 +2,8 @@
 
 SerialComms::SerialComms(const char *port_name) 
 {
+    queue = SerialRequestQueue();
+
 #ifdef LINUX
     // attempt to open the serial port
     port = open(port_name, O_RDWR);
@@ -21,7 +23,7 @@ SerialComms::SerialComms(const char *port_name)
     #ifdef CUSTOM_BAUD
 
     #ifdef DEBUG_PACKETS
-        fprintf(stderr, "configuring custom baud (%fMbps)\n", USB_BAUD / 1.0e+6);
+        fprintf(stderr, "configuring custom baud (%.2fMbps)\n", USB_BAUD / 1.0e+6);
     #endif
 
         // on linux custom baud must be set through baud rate aliasing
@@ -208,30 +210,18 @@ void SerialComms::write_footer()
     write_uint(crc16, 2);
 }
 
-void SerialComms::send_packet(SerialPacket::CommandID cmd_id, uint8_t *data, uint16_t length)
+void SerialComms::send_packet(const RawPacket &packet)
 {
     // stage all components of packet
-    write_header(length);
-    write_uint((uint16_t) cmd_id, 2);
+    write_header(packet.length);
+    write_uint(static_cast<uint16_t>(packet.cmd_id), 2);
 
-    for (int i = 0; i < length; i++) {
-        write_byte(data[i]);
+    for (int i = 0; i < packet.length; i++) {
+        write_byte(packet.data[i]);
     }
 
     write_footer();
     flush_write_buffer();
-}
-
-// send DATA_REQUEST
-void SerialComms::request_data(SerialPacket::CommandID cmd_id, uint8_t sensor_id)
-{
-    uint8_t data[3];
-    
-    data[0] = (uint16_t) cmd_id & 0xFF;
-    data[1] = (uint16_t) cmd_id >> 8;
-    data[2] = sensor_id;
-
-    send_packet(SerialPacket::DATA_REQUEST, data, 3);
 }
 
 int SerialComms::read_byte()
@@ -268,14 +258,14 @@ int SerialComms::read_bytes(uint8_t *data, int count)
     for (read_count = 0; read_count < count; read_count++) {
         int byte = read_byte();
         if (byte >= 0) {
-            data[read_count] = (uint8_t) byte;
+            data[read_count] = static_cast<uint8_t>(byte);
         } else {
             break;
         }
     }
     return read_count;
 #else
-    return Serial.readBytes(data, count);
+    return Serial.readBytes(reinterpret_cast<char*>(data), count);
 #endif
 }
 
@@ -300,15 +290,68 @@ uint16_t SerialComms::decode_short(int offset, uint8_t *data)
     return static_cast<uint16_t>(decode_uint(offset, 2, data));
 }
 
-int SerialComms::read_packet(SerialPacket& packet)
+int SerialComms::calc_data_response_size(SerialPacket::CommandID cmd_id)
+{
+    switch (cmd_id) {
+        case SerialPacket::DR16:
+            return 29;
+        case SerialPacket::REV_ENCODER:
+            return 5;
+        case SerialPacket::ISM:
+            return 13;
+        default:
+            return 0;
+    }
+    return 0;
+}
+
+void SerialComms::enqueue_packet(SerialPacket::CommandID cmd_id, uint8_t *data, uint16_t length)
+{
+    RawPacket packet = RawPacket(cmd_id);
+
+    for (int i = 0; i < length; i++) {
+        packet.data[i] = data[i];
+    }
+
+    packet.length = length;
+    queue.enq_request(packet);
+}
+
+void SerialComms::enqueue_data_request(SerialPacket::CommandID cmd_id, uint8_t sensor_id)
+{
+#ifdef LINUX
+    uint8_t data[3];
+    data[0] = cmd_id & 0xFF;
+    data[1] = cmd_id >> 8;
+    data[2] = sensor_id;
+    enqueue_packet(SerialPacket::DATA_REQUEST, data, 3);
+#endif
+}
+
+/// @brief send as many packets as possible on this loop iteration
+int SerialComms::flush_queue(int loop_freq)
+{
+    int bitrate_limit = USB_BAUD / loop_freq;
+    int throughput = 0;
+
+    while (!queue.empty() && bitrate_limit >= 0) {
+        SerialRequest *curr_req = queue.peek();
+        send_packet(curr_req->packet);
+        bitrate_limit -= calc_data_response_size(curr_req->packet.cmd_id);
+        queue.deq_request();
+        throughput++;
+    }
+
+    return throughput;
+}
+
+bool SerialComms::read_packet(SerialPacket& packet)
 {
     int byte;
     uint8_t temp[4];
 
     // try to pull bytes from the stream until a start byte is encountered
     while ((byte = read_byte()) >= 0) {
-        // #if defined(DEBUG)
-
         if (byte == START_BYTE) {
 
         #if defined(DEBUG_PACKETS) && defined(LINUX)
@@ -399,6 +442,8 @@ int SerialComms::read_packet(SerialPacket& packet)
             // utility arrays for decoding packet data
             float float_arr[16] = {0.0};
             uint32_t uint32_arr[16] {0};
+            uint8_t sensor_id;
+
             union {
                 uint32_t u32;
                 float f32;
@@ -406,28 +451,41 @@ int SerialComms::read_packet(SerialPacket& packet)
 
             packet.cmd_id = static_cast<SerialPacket::CommandID>(cmd_id);
             switch (cmd_id) {
+                /**
+                * TEENSY SIDE
+                */
+                case SerialPacket::DATA_REQUEST:
+                    packet.data_req.cmd_id = static_cast<SerialPacket::CommandID>(decode_uint(0, 2, data));
+                    packet.data_req.sensor_id = data[3];
+                    break;
+
+                /**
+                * KHADAS SIDE
+                */
                 // sensors and estimators
                 case 0x0101: // estimator state
                     break;
                 case 0x0102: // motor feedback
                     break;
                 case SerialPacket::DR16: // DR16 data
+                    sensor_id = data[0];
+
                     for (int i = 0; i < 5; i++) {
-                        bitcaster.u32 = static_cast<uint32_t>(decode_uint(i * 4, 4, data));
+                        bitcaster.u32 = static_cast<uint32_t>(decode_uint(1 + i * 4, 4, data));
                         float_arr[i] = bitcaster.f32;
                     }
 
                     for (int i = 0; i < 2; i++) {
-                        uint32_arr[i] = static_cast<uint32_t>(decode_uint(20 + i * 4, 4, data));
+                        uint32_arr[i] = static_cast<uint32_t>(decode_uint(1 + 20 + i * 4, 4, data));
                     }
 
-                    packet.dr16.l_stick_x = float_arr[0];
-                    packet.dr16.l_stick_y = float_arr[1];
-                    packet.dr16.r_stick_x = float_arr[2];
-                    packet.dr16.r_stick_y = float_arr[3];
-                    packet.dr16.wheel = float_arr[4];
-                    packet.dr16.l_switch = uint32_arr[0];
-                    packet.dr16.r_switch = uint32_arr[1];
+                    packet.dr16[sensor_id].l_stick_x = float_arr[0];
+                    packet.dr16[sensor_id].l_stick_y = float_arr[1];
+                    packet.dr16[sensor_id].r_stick_x = float_arr[2];
+                    packet.dr16[sensor_id].r_stick_y = float_arr[3];
+                    packet.dr16[sensor_id].wheel = float_arr[4];
+                    packet.dr16[sensor_id].l_switch = uint32_arr[0];
+                    packet.dr16[sensor_id].r_switch = uint32_arr[1];
 
                 #if defined(DEBUG_PACKETS) && defined(LINUX)
                     fprintf(
@@ -441,20 +499,21 @@ int SerialComms::read_packet(SerialPacket& packet)
                         "\t\tl_switch: %u\n"
                         "\t\tr_switch: %u\n",
                         packet.cmd_id,
-                        packet.dr16.l_stick_x,
-                        packet.dr16.l_stick_y,
-                        packet.dr16.r_stick_x,
-                        packet.dr16.r_stick_y,
-                        packet.dr16.wheel,
-                        packet.dr16.l_switch,
-                        packet.dr16.r_switch
+                        packet.dr16[sensor_id].l_stick_x,
+                        packet.dr16[sensor_id].l_stick_y,
+                        packet.dr16[sensor_id].r_stick_x,
+                        packet.dr16[sensor_id].r_stick_y,
+                        packet.dr16[sensor_id].wheel,
+                        packet.dr16[sensor_id].l_switch,
+                        packet.dr16[sensor_id].r_switch
                     );
                 #endif
                     
                     break;
                 case SerialPacket::REV_ENCODER: // rev encoder
-                    bitcaster.u32 = static_cast<uint32_t>(decode_uint(0, 4, data));
-                    packet.rev_encoder.angle = bitcaster.f32;
+                    sensor_id = data[0];
+                    bitcaster.u32 = static_cast<uint32_t>(decode_uint(1, 4, data));
+                    packet.rev_encoder[sensor_id].angle = bitcaster.f32;
 
                 #if defined(DEBUG_PACKETS) && defined(LINUX)
                     fprintf(
@@ -462,20 +521,22 @@ int SerialComms::read_packet(SerialPacket& packet)
                         "\tRev Encoder packet data (%#02x):\n"
                         "\t\tangle: %f\n",
                         packet.cmd_id,
-                        packet.rev_encoder.angle * 180/3.14159
+                        packet.rev_encoder[sensor_id].angle * 180/3.14159
                     );
                 #endif
 
                     break;
                 case SerialPacket::ISM: // ISM
+                    sensor_id = data[0];
+
                     for (int i = 0; i < 3; i++) {
-                        bitcaster.u32 = static_cast<uint32_t>(decode_uint(i * 4, 4, data));
+                        bitcaster.u32 = static_cast<uint32_t>(decode_uint(1 + i * 4, 4, data));
                         float_arr[i] = bitcaster.f32;
                     }
 
-                    packet.ism.psi = float_arr[0];
-                    packet.ism.theta = float_arr[1];
-                    packet.ism.phi = float_arr[2];
+                    packet.ism[sensor_id].psi = float_arr[0];
+                    packet.ism[sensor_id].theta = float_arr[1];
+                    packet.ism[sensor_id].phi = float_arr[2];
 
                 #if defined(DEBUG_PACKETS) && defined(LINUX)
                     fprintf(
@@ -485,9 +546,9 @@ int SerialComms::read_packet(SerialPacket& packet)
                         "\t\tpsi: %f\n"
                         "\t\tpsi: %f\n",
                         packet.cmd_id,
-                        packet.ism.psi,
-                        packet.ism.theta,
-                        packet.ism.phi
+                        packet.ism[sensor_id].psi,
+                        packet.ism[sensor_id].theta,
+                        packet.ism[sensor_id].phi
                     );
                 #endif
 
@@ -501,10 +562,10 @@ int SerialComms::read_packet(SerialPacket& packet)
             }
 
             // successful packet read
-            return 0;
+            return true;
         }
     }
     
     // while loop broke, packet was not found
-    return -1;
+    return false;
 }
