@@ -239,6 +239,9 @@ int SerialComms::read_byte()
             read_buffer_current_size = 0;
             read_buffer_offset = 0;
         }
+
+        if (result > 0)
+            printf("%d > ", result);
     }
 
     if (read_buffer_current_size > 0) {
@@ -335,10 +338,10 @@ int SerialComms::flush_queue(int loop_freq)
     int throughput = 0;
 
     while (!queue.empty() && bitrate_limit >= 0) {
-        SerialRequest *curr_req = queue.peek();
-        send_packet(curr_req->packet);
-        bitrate_limit -= calc_data_response_size(curr_req->packet.cmd_id);
-        queue.deq_request();
+        RawPacket packet;
+        queue.deq_request(packet);
+        send_packet(packet);
+        bitrate_limit -= calc_data_response_size(packet.cmd_id);
         throughput++;
     }
 
@@ -358,8 +361,11 @@ bool SerialComms::read_packet(SerialPacket& packet)
             fprintf(stderr, "\n[ATTEMPTING PACKET READ]\n");
         #endif
 
+            stats.read_attempts++;
+
             // read the packet header
             if (read_bytes(temp, 4) < 4) {
+                stats.incomplete_packet++;
                 break;
             }
 
@@ -377,6 +383,7 @@ bool SerialComms::read_packet(SerialPacket& packet)
 
             // read the packet data section
             if (read_bytes(temp, 2) < 2) {
+                stats.incomplete_packet++;
                 break;
             }
 
@@ -408,16 +415,19 @@ bool SerialComms::read_packet(SerialPacket& packet)
                 fprintf(stderr, "\t(!) CRC8 checksums do not match\n");
             #endif
 
+                stats.crc8_fails++;
                 break;
             }
         #endif
         
             if (read_bytes(data, data_length) < data_length) {
+                stats.incomplete_packet++;
                 break;
             }
 
             // read the packet footer
             if (read_bytes(temp, 2) < 2) {
+                stats.incomplete_packet++;
                 break;
             }
 
@@ -435,6 +445,7 @@ bool SerialComms::read_packet(SerialPacket& packet)
                 fprintf(stderr, "\t(!) CRC16 checksums do not match\n");
             #endif
                 
+                stats.crc16_fails++;
                 break;
             }
         #endif
