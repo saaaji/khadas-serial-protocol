@@ -1,3 +1,11 @@
+#define termios asm_termios
+#define winsize asm_winsize
+#define termio asm_termio
+#include <asm/termios.h>
+#undef termios
+#undef winsize
+#undef termio
+
 #include "SerialComms.hpp"
 #include <chrono>
 #include <string>
@@ -17,8 +25,86 @@ uint32_t bit_cast(float f) {
 typedef std::chrono::high_resolution_clock sys_time;
 typedef std::chrono::duration<uint32_t, std::micro> micros;
 
-//for linux machine
 int main(int argc, char **argv) {
+    int cycle_time_us = 1'000'000 / CYCLE_FREQ_HZ;
+
+    if (argc < 2)
+        return 1;
+
+    int payload_size = std::atoi(argv[1]);
+    char *payload = new char[payload_size]; // n bytes
+
+    for (int i = 0; i < payload_size; i++) {
+        payload[i] = static_cast<char>(i % 255);
+    }
+
+    int port = open("/dev/ttyACM0", O_RDWR);
+
+    struct termios tty;
+    speed_t brate = B38400;
+    tcgetattr(port, &tty);
+    
+    cfsetospeed(&tty, brate);
+    cfsetispeed(&tty, brate);
+
+    tty.c_cflag |= (CLOCAL | CREAD);
+    tty.c_cflag &= ~PARENB;    // No parity
+    tty.c_cflag &= ~CSTOPB;    // 1 stop bit
+    tty.c_cflag &= ~CSIZE;
+    tty.c_cflag |= CS8;        // 8 data bits
+    tty.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
+    tty.c_oflag &= ~OPOST;
+    tty.c_cc[VMIN] = 0;
+    tty.c_cc[VTIME] = 0; // NOBLOCK
+    
+    tcsetattr(port, TCSANOW, &tty);
+
+    // struct termios2 tty2;
+    // ioctl(port, TCGETS2, &tty2);
+    // tty2.c_cflag &= ~CBAUD;
+    // tty2.c_cflag |= BOTHER;
+    // tty2.c_ispeed = 480000000;
+    // tty2.c_ospeed = 480000000;
+    // ioctl(port, TCSETS2, &tty2);
+
+    int blen = 4096;
+    char bytes[blen];
+
+    for (int i = 0; i < 5; i++) {
+        // send n bytes
+        int res = write(port, payload, payload_size);
+        // tcdrain(port);
+        printf("WBUF: %d\n", res);
+
+        int recv = 0;
+        int streak = 0;
+
+        printf("RBUF:");
+        while (true) {
+            auto start = sys_time::now();
+            int res = read(port, bytes, blen);
+            if (res > 0) {
+                printf(" %d", res);
+                streak = 0;
+                recv += res;
+            } else if (res == 0) {
+                streak++;
+            }
+            
+            if (recv >= payload_size || streak >= 100) break;
+            while (std::chrono::duration_cast<micros>(sys_time::now() - start).count() < cycle_time_us);
+        }
+
+        printf("\nTRIAL %d > recv: %d / %d\n\n", i, recv, payload_size);
+    }
+
+    delete payload;
+
+    return 0;
+}
+
+//for linux machine
+/*int main(int argc, char **argv) {
     SerialComms serial_comms("/dev/ttyACM0");
     SerialPacket packet;
 
@@ -88,4 +174,4 @@ int main(int argc, char **argv) {
     }
     
     return 0;
-}
+}*/
