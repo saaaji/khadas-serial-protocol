@@ -10,7 +10,7 @@
 #include <chrono>
 #include <string>
 
-constexpr int CYCLE_FREQ_HZ = 100; // Hz
+constexpr int CYCLE_FREQ_HZ = 1000; // Hz
 constexpr int PACKET_DUMP_COUNT = 150;
 
 uint32_t bit_cast(float f) {
@@ -35,8 +35,9 @@ int main(int argc, char **argv) {
     char *payload = new char[payload_size]; // n bytes
 
     for (int i = 0; i < payload_size; i++) {
-        payload[i] = static_cast<char>(i % 255);
+        payload[i] = static_cast<char>(0);
     }
+    payload[0] = 1;
 
     int port = open("/dev/ttyACM0", O_RDWR);
 
@@ -59,18 +60,26 @@ int main(int argc, char **argv) {
     
     tcsetattr(port, TCSANOW, &tty);
 
-    // struct termios2 tty2;
-    // ioctl(port, TCGETS2, &tty2);
-    // tty2.c_cflag &= ~CBAUD;
-    // tty2.c_cflag |= BOTHER;
-    // tty2.c_ispeed = 480000000;
-    // tty2.c_ospeed = 480000000;
-    // ioctl(port, TCSETS2, &tty2);
-
+    struct termios2 tty2;
+    ioctl(port, TCGETS2, &tty2);
+    tty2.c_cflag &= ~CBAUD;
+    tty2.c_cflag |= BOTHER;
+    tty2.c_ispeed = 480000000;
+    tty2.c_ospeed = 480000000;
+    // tty2.c_cc[VMIN] = 0;
+    // tty2.c_cc[VTIME] = 0;
+    // tty2.c_cflag |= (CLOCAL | CREAD);
+    // tty2.c_cflag &= ~PARENB;    // No parity
+    // tty2.c_cflag &= ~CSTOPB;    // 1 stop bit
+    // tty2.c_cflag &= ~CSIZE;
+    // tty2.c_cflag |= CS8;        // 8 data bits
+    // tty2.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
+    // tty2.c_oflag &= ~OPOST;
+    ioctl(port, TCSETS2, &tty2);
     int blen = 4096;
     char bytes[blen];
 
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 1; i++) {
         // send n bytes
         int res = write(port, payload, payload_size);
         // tcdrain(port);
@@ -79,19 +88,22 @@ int main(int argc, char **argv) {
         int recv = 0;
         int streak = 0;
 
-        printf("RBUF:");
+        // printf("RBUF:");
+        int j = 0;
         while (true) {
+            j++;
             auto start = sys_time::now();
             int res = read(port, bytes, blen);
             if (res > 0) {
-                printf(" %d", res);
+                // printf(" %d", res);
                 streak = 0;
                 recv += res;
             } else if (res == 0) {
                 streak++;
             }
             
-            if (recv >= payload_size || streak >= 100) break;
+            if (j%1000==0) printf("R: %d\n", recv);
+            if (recv >= payload_size) break;
             while (std::chrono::duration_cast<micros>(sys_time::now() - start).count() < cycle_time_us);
         }
 
