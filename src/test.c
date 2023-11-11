@@ -1,4 +1,3 @@
-
 #include <poll.h>
 #include <stdlib.h>
 #include <stdint.h> // integer types
@@ -9,6 +8,9 @@
 #include <errno.h> // error tracking
 #include <sys/ioctl.h>
 #include <sys/time.h>
+#include <sys/types.h>
+#include <linux/serial.h>
+#include <string.h>
 #define termios asm_termios
 #include <asm/termbits.h>
 #include <asm/ioctls.h>
@@ -39,10 +41,13 @@ int init_uart(int port) {
     tty.c_cflag |= CS8; // 1 "char" = 8 bits
     tty.c_cflag &= ~PARENB; // disable bit parity check
     tty.c_cflag &= ~CSTOPB; // 1 stop bit
-    tty.c_cflag &= ~CRTSCTS; // disable HW flow control (RTS)
+    // tty.c_cflag &= ~CRTSCTS; // disable HW flow control (RTS)
     tty.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
     tty.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
     tty.c_oflag &= ~OPOST; // disable implementation-based output processing
+
+    cfsetispeed(&tty, B9600);
+    cfsetospeed(&tty, B9600);
 
     if (tcsetattr(port, TCSANOW, &tty) < 0) {
         return -1;
@@ -56,6 +61,19 @@ int init_uart(int port) {
     if (tcgetattr(port, &tty) < 0) {
         return -1;
     }
+
+    struct serial_struct kernel_serial_settings;
+    
+    if (ioctl(port, TIOCGSERIAL, &kernel_serial_settings) < 0) {
+        return -1;
+    }
+
+    kernel_serial_settings.flags |= ASYNC_LOW_LATENCY;
+
+    if (ioctl(port, TIOCSSERIAL, &kernel_serial_settings) < 0) {
+        return -1;
+    }
+
 
     return 0;
 }
@@ -121,13 +139,13 @@ int main(int argc, char **argv) {
     unsigned char *data = (char *)calloc(sizeof(unsigned char), alloc_size); // 50K allocation
 
     for (int i = 0; i < alloc_size; i++) {
-        data[i] = i % 100; // mark each
+        data[i] = 'A' + i % ('Z' - 'A' + 1); // mark each
     }
 
     int bitrate_limit = (int)(bitrate_util * TEENSY_BITRATE / 8) / freq;
 
     printf(
-        "freq: %d\nbitrate_util: %lf\npayload_size: %dbitrate_limit: %d\n", 
+        "freq: %d\nbitrate_util: %lf\npayload_size: %d\nbitrate_limit: %d\n", 
         freq, 
         bitrate_util, 
         payload_size,
@@ -157,7 +175,9 @@ int main(int argc, char **argv) {
         // write
         if (bytes_sent < payload_size) {         
             int write_limit = MIN(bitrate_limit, alloc_size);
-            int num_written = write(port, data, write_limit);   
+            int num_written = write(port, data, write_limit);
+            // tcdrain(port);
+
             if (num_written < 0 && errno != EAGAIN) {
                 printf("write failed: %d\n", errno);
             } else {
@@ -172,38 +192,26 @@ int main(int argc, char **argv) {
             }
         }
 
-        // read
-        // poll(&pfd, 1, 0);
-        // while (pfd.revents & POLLIN) {
-        //     int num_read = read(port, read_buf, read_buf_size);
-        //     if (num_read < 0 && errno == EAGAIN || num_read == 0) {
-        //         break;
-        //     } else if (num_read < 0 && errno != EAGAIN) {
-        //         printf("read failed: %d\n", errno);
-        //     } else {
-        //         bytes_recv += num_read;
-        //     }
-        // }
-
         while (elapsed_micros(st) < cycle_time_micros) {
             continue;
         }
 
-        if (counter % 10 == 0) {
-            printf(
-                "TX(%ld / %ld) : %.2f Hz\n", 
-                bytes_recv, 
-                bytes_sent,
-                counter / (elapsed_micros(global_st) / (float)S_TO_MICROS)
-            );
-        }
+        // if (counter % 10 == 0) {
+        //     printf(
+        //         "TX(%ld / %ld) : %.2f Hz\n", 
+        //         bytes_recv, 
+        //         bytes_sent,
+        //         counter / (elapsed_micros(global_st) / (float)S_TO_MICROS)
+        //     );
+        // }
 
         // if ((float)elapsed_micros(global_st) / S_TO_MICROS > 5.0f) {
         //     break;
         // }
     }
 
-    printf("TIME: %f\n", elapsed_micros(global_st) / (float)S_TO_MICROS);
+    float ts = elapsed_micros(global_st) / (float) S_TO_MICROS;
+    printf("TIME: %f (%f)\n", ts, ((8 * bytes_sent) / ts));
 
     if (data != NULL) {
         free(data);
