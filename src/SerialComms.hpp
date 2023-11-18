@@ -26,6 +26,10 @@
 #include <err.h> // more error tracking
 #include <sys/ioctl.h> // baud rate aliasing on Linux
 #include <linux/serial.h> // baud rate aliasing on Linux
+#define termios asm_termios
+#include <asm/termbits.h>
+#include <asm/ioctls.h>
+#undef termios
 
 #else // TEENSY
 
@@ -387,7 +391,10 @@ class SerialComms {
         /// @param size size of the data array
         /// @return the crc16 value
         uint16_t generate_crc16(const uint8_t *data, int size);
-        
+
+        int init_uart(int port);
+        int config_uart_bitrate(int port, int bitrate);
+
     public:
         /// @brief construct a SerialComms object
         /// @param port_name C string referring to the serial port (Linux) or empty string (Teensy)

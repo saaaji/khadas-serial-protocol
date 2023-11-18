@@ -8,92 +8,14 @@ SerialComms::SerialComms(const char *port_name)
     // attempt to open the serial port
     port = open(port_name, O_RDWR);
 
-    // check if Teensy is connected
-    if (port < 0) {
-        log_err("open", "Teensy may be disconnected");
-    } else {
-        // Configure the serial port settings
-        struct termios tty;
-        struct serial_struct serial;
-
-        if (tcgetattr(port, &tty) < 0) {
-            log_err("tcgetattr");
-        }
-
-    #ifdef CUSTOM_BAUD
-
-    #ifdef DEBUG_PACKETS
-        fprintf(stderr, "configuring custom baud (%.2fMbps)\n", USB_BAUD / 1.0e+6);
-    #endif
-
-        // on linux custom baud must be set through baud rate aliasing
-        serial.reserved_char[0] = 0;
-        
-        if (ioctl(port, TIOCGSERIAL, &serial) < 0) {
-            log_err("ioctl[TIOCGSERIAL]");
-        }
-
-        serial.flags &= ~ASYNC_SPD_MASK;
-        serial.flags |= ASYNC_SPD_CUST;
-        serial.custom_divisor = (serial.baud_base + (USB_BAUD / 2)) / USB_BAUD;
-        
-        if (serial.custom_divisor < 1) {
-            serial.custom_divisor = 1;
-        }
-
-        if (ioctl(port, TIOCSSERIAL, &serial) < 0) {
-            log_err("ioctl[TIOCSSERIAL]");
-        }
-
-        if (ioctl(port, TIOCGSERIAL, &serial) < 0) {
-            log_err("iotcl[TIOCSSERIAL]");
-        }
-
-        if (serial.custom_divisor * USB_BAUD != serial.baud_base) {
-            warnx("actual baudrate is %d / %d = %f",
-                  serial.baud_base, serial.custom_divisor,
-                  (float) serial.baud_base / serial.custom_divisor);
-        }
-
-        if (cfsetospeed(&tty, B38400) < 0) {
-            log_err("cfsetospeed");
-        }
-
-        if (cfsetispeed(&tty, B38400) < 0) {
-            log_err("cfsetispeed");
-        }
-
-    #else // B<rate>
-
-        // if baud rate is one of the B<rate> constants
-        if (cfsetospeed(&tty, FALLBACK_BAUD) < 0) {
-            log_err("cfsetospeed");
-        }
-
-        if (cfsetispeed(&tty, FALLBACK_BAUD) < 0) {
-            log_err("cfsetispeed");
-        }
-        
-    #endif
-
-        // setting "raw mode" attributes according to man7.org/linux/man-pages/man3/termios3.html
-        tty.c_cflag |= (CLOCAL | CREAD);
-        tty.c_cflag &= ~PARENB;    // No parity
-        tty.c_cflag &= ~CSTOPB;    // 1 stop bit
-        tty.c_cflag &= ~CSIZE;
-        tty.c_cflag |= CS8;        // 8 data bits
-        tty.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG);
-        tty.c_oflag &= ~OPOST;
-        
-        // set VMIN and VTIME to 0 (for total non-blocking reads)
-        // man page warns against this so alternatives are welcomed
-        tty.c_cc[VMIN] = 0;
-        tty.c_cc[VTIME] = 0;
-        
-        if (tcsetattr(port, TCSANOW, &tty) < 0) {
-            log_err("tcsetattr");
-        }
+    if (init_uart(port) < 0) {
+        log_err("init_uart");
     }
+
+    if (config_uart_bitrate(port, USB_BAUD) < 0) {
+        log_err("config_uart_bitrate");
+    }
+
 #else // TEENSY
     // baud rate setting is ignored, native 480 Mbps always used
     port = 0;
@@ -109,6 +31,87 @@ SerialComms::~SerialComms()
         log_err("close", "Teensy may be disconnected");
     }
 #endif // no handles to release on teensy
+}
+
+// check errno when return is -1
+int SerialComms::init_uart(int port) {
+    struct termios tty;
+
+    if (tcgetattr(port, &tty) < 0) {
+        return -1;
+    }
+
+    // "raw" mode
+    tty.c_cflag |= (CLOCAL | CREAD); // ignore modem control lines, enable receiver
+    tty.c_cflag &= ~CSIZE;
+    tty.c_cflag |= CS8; // 1 "char" = 8 bits
+    tty.c_cflag &= ~PARENB; // disable bit parity check
+    tty.c_cflag &= ~CSTOPB; // 1 stop bit
+    // tty.c_cflag &= ~CRTSCTS; // disable HW flow control (RTS)
+    tty.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
+    tty.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
+    tty.c_oflag &= ~OPOST; // disable implementation-based output processing
+
+    tty.c_cc[VMIN] = 0;
+    tty.c_cc[VTIME] = 0;
+
+    if (tcsetattr(port, TCSANOW, &tty) < 0) {
+        return -1;
+    }
+
+    /*
+    man page: "tcsetattr() returns success if any of the requested changes could 
+    successfully be carried out...when making multiple changes...follow this call with a
+    further call to tcgetattr to check that all changes have been performed successfully"
+    */
+    if (tcgetattr(port, &tty) < 0) {
+        return -1;
+    }
+
+    struct serial_struct kernel_serial_settings;
+    
+    if (ioctl(port, TIOCGSERIAL, &kernel_serial_settings) < 0) {
+        return -1;
+    }
+
+    kernel_serial_settings.flags |= ASYNC_LOW_LATENCY;
+
+    if (ioctl(port, TIOCSSERIAL, &kernel_serial_settings) < 0) {
+        return -1;
+    }
+
+
+    return 0;
+}
+
+// if return value is less than 0, check errno
+// https://man7.org/linux/man-pages/man2/ioctl_tty.2.html
+int SerialComms::config_uart_bitrate(int port, int bitrate) {
+    struct termios2 tty;
+
+    // ioctl equivalent to "tc(get/set)attr"
+    if (ioctl(port, TCGETS2, &tty) < 0) {
+        return -1;
+    }
+
+    /*
+    man page: "If...c_cflag contains the flag BOTHER, then the baud rate is
+    stored in the structure members c_ispeed and c_ospeed as integer values"
+    */
+    tty.c_cflag &= ~CBAUD;
+    tty.c_cflag |= BOTHER;
+    tty.c_ispeed = bitrate;
+    tty.c_ospeed = bitrate;
+
+    if (ioctl(port, TCSETS2, &tty) < 0) {
+        return -1;
+    }
+
+    if (ioctl(port, TCGETS2, &tty) < 0) {
+        return -1;
+    }
+
+    return 0;
 }
 
 void SerialComms::log_err(const char* func_name, const char* msg)
@@ -239,9 +242,6 @@ int SerialComms::read_byte()
             read_buffer_current_size = 0;
             read_buffer_offset = 0;
         }
-
-        if (result > 0)
-            printf("%d > ", result);
     }
 
     if (read_buffer_current_size > 0) {
