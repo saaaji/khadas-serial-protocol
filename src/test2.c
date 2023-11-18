@@ -1,4 +1,4 @@
-#include <poll.h>
+#define _DEFAULT_SOURCE
 #include <stdlib.h>
 #include <stdint.h> // integer types
 #include <stdio.h> // printf and family
@@ -9,14 +9,14 @@
 #include <sys/ioctl.h>
 #include <sys/time.h>
 #include <sys/types.h>
-#include <linux/serial.h>
 #include <string.h>
+#include <signal.h>
 #define termios asm_termios
 #include <asm/termbits.h>
 #include <asm/ioctls.h>
 #undef termios
 
-#define MIN(a, b) ((a) < (b) ? (a) : (b))
+
 
 const int TEENSY_BITRATE = 480000000;
 const int S_TO_MICROS = 1000000;
@@ -27,6 +27,9 @@ int elapsed_micros(const struct timeval st) {
     gettimeofday(&et, NULL);
     return (et.tv_sec - st.tv_sec) * S_TO_MICROS + (et.tv_usec - st.tv_usec);
 }
+
+#define SECONDS(st) (elapsed_micros(st) / (float)MEGA)
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 // check errno when return is -1
 int init_uart(int port) {
@@ -47,6 +50,7 @@ int init_uart(int port) {
     tty.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
     tty.c_oflag &= ~OPOST; // disable implementation-based output processing
 
+    // blocking reads
     tty.c_cc[VMIN] = 1;
     tty.c_cc[VTIME] = 0;
 
@@ -62,19 +66,6 @@ int init_uart(int port) {
     if (tcgetattr(port, &tty) < 0) {
         return -1;
     }
-
-    struct serial_struct kernel_serial_settings;
-    
-    if (ioctl(port, TIOCGSERIAL, &kernel_serial_settings) < 0) {
-        return -1;
-    }
-
-    kernel_serial_settings.flags |= ASYNC_LOW_LATENCY;
-
-    if (ioctl(port, TIOCSSERIAL, &kernel_serial_settings) < 0) {
-        return -1;
-    }
-
 
     return 0;
 }
@@ -109,6 +100,28 @@ int config_uart_bitrate(int port, int bitrate) {
     return 0;
 }
 
+unsigned char *write_buffer = NULL;
+void cleanup() {
+    printf("cleaning write buffer...\n");
+    free(write_buffer);
+    write_buffer = NULL;
+    exit(EXIT_SUCCESS);
+}
+
+typedef enum {
+    SEEK_SOF,
+    READ_HEADER,
+    READ_BODY,
+} State;
+
+typedef struct {
+    State state;
+
+    size_t offset;
+    unsigned char header[7];
+    unsigned char body[1024];
+} FSM;
+
 int main(int argc, char **argv) {
     int port = open(argv[1], O_RDWR | O_NOCTTY);
 
@@ -127,25 +140,36 @@ int main(int argc, char **argv) {
         exit(EXIT_FAILURE);
     }
 
+    struct sigaction act;
+    memset(&act, 0, sizeof(act));
+    act.sa_handler = cleanup;
+    act.sa_flags = 0;
+    if (sigaction(SIGINT, &act, NULL) < 0) {
+        printf("could not configure cleanup handler: %d\n", errno);
+    }
+
     int freq = 2000;
     int cycle_time_micros = S_TO_MICROS / freq;
     int transfer_speed = TEENSY_BITRATE / 8;
     int bitrate_throttle_limit = transfer_speed / freq;
 
-    size_t read_buf_size = 4095;
-    unsigned char read_buf[read_buf_size];
+    size_t read_buffer_size = 4095;
+    unsigned char read_buffer[read_buffer_size];
 
-    struct timeval global_st;
-    gettimeofday(&global_st, NULL);
+    struct timeval prog_st;
+    gettimeofday(&prog_st, NULL);
 
-    unsigned char test_packet[] = {0xa5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    unsigned char test_packet[] = {0xa5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     int packet_len = 15;
 
-    unsigned char *write_buffer = (unsigned char *) calloc(sizeof(unsigned char), bitrate_throttle_limit);
+    write_buffer = (unsigned char *) calloc(sizeof(unsigned char), bitrate_throttle_limit);
     int write_idx = 0;
+    int total_sent = 0;
+    int total_recv = 0;
 
-    int global_sent = 0;
-    int global_recv = 0;
+    FSM fsm;
+    fsm.state = SEEK_SOF;
+    fsm.offset = 0;
     for (int counter = 0;; counter++) {
         struct timeval st;
         gettimeofday(&st, NULL);
@@ -161,16 +185,35 @@ int main(int argc, char **argv) {
         ssize_t num_written = write(port, write_buffer, bitrate_throttle_limit);
 
         int recv = 0;
-        while (recv < num_written)
-            recv += read(port, read_buf, MIN(read_buf_size, num_written - recv));
+        while (recv < num_written) {
+            int res = read(port, read_buffer, MIN(read_buffer_size, num_written - recv));
+            if (res > 0) {
+                recv += res;
+                for (int i = 0; i < res; i++) {
+                    unsigned char byte = read_buffer[i];
+                    switch (fsm.state) {
+                        case SEEK_SOF:
+                            if (byte == 0xA5) {
+                                fsm.state = READ_HEADER;
+                            }
+                            break;
+                        case READ_HEADER:
+                            // if (fsm.offset < )
+                            break;
+                        case READ_BODY:
+                            break;
+                    }
+                }
+            }
+        }
 
-        global_sent += num_written;
-        global_recv += recv;
+        total_sent += num_written;
+        total_recv += recv;
         
-        float elapsed_s = elapsed_micros(global_st) / 1000000.0;
+        float elapsed_s = elapsed_micros(prog_st) / MEGA;
         printf("THROUGHPUT: %.2fMbps R / %.2fMbps W\n", 
-            (global_recv * 8.0) / MEGA / elapsed_s,
-            (global_sent * 8.0) / MEGA / elapsed_s);
+            (total_recv * 8.0) / MEGA / elapsed_s,
+            (total_sent * 8.0) / MEGA / elapsed_s);
 
         while (elapsed_micros(st) < cycle_time_micros) {
             continue;
