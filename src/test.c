@@ -1,405 +1,461 @@
-
-
-// SPDX-License-Identifier: CC0-1.0
-// gcc -Wall -O2 this.c -lrt -o this && ./this /dev/ttyACM0
-#define  _POSIX_C_SOURCE  200809L
-#define  _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE
 #include <stdlib.h>
-#include <inttypes.h>
-#include <unistd.h>
+#include <stdint.h> // integer types
+#include <stdio.h> // printf and family
+#include <fcntl.h> // file IO
+#include <unistd.h> // more file IO
+#include <termios.h> // serial config
+#include <errno.h> // error tracking
 #include <sys/ioctl.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <termios.h>
+#include <sys/time.h>
 #include <signal.h>
-#include <time.h>
 #include <string.h>
-#include <stdio.h>
-#include <errno.h>
+#include <poll.h>
+#define termios asm_termios
+#include <asm/termbits.h>
+#include <asm/ioctls.h>
+#undef termios
 
-/* Input buffer size.  Use a power of two larger than 512; I'd recommend 4096 - 65536.
-*/
-#ifndef  BUFFER_SIZE
-#define  BUFFER_SIZE  512
-#endif
+// constants
+#define MAX_DATA_SIZE 1024
 
-/* Units of MB: 1000000 or 1048576
-*/
-#ifndef  MEGA
-#define  MEGA  1000000
-#endif
+const int TARGET_BITRATE = 15000 * 8; // bps
+const int MEGA = 1000000; // unit conversions
+const int KILO = 1000;
+const int USB_BULK_LATENCY = 15 /* ms */ * KILO; // micros
+const int LOOP_FREQ = 1000;
+const int CYCLE_TIME_MICROS = MEGA / LOOP_FREQ;
+const int TRANSFER_SPEED_BYTES = TARGET_BITRATE / 8; // bytes/s
+const int BITRATE_THROTTLE_LIMIT = TRANSFER_SPEED_BYTES / LOOP_FREQ; // bytes/cycle
+const int READ_BUFFER_SIZE = 4095; // bytes
+const int MAGIC = 0xa5;
 
-/* Xorshift64* pseudo-random number generator.  Zero state is invalid.
-*/
-static uint64_t  prng_state = 0;
-
-/* Return only the upper 32 bits of XorShift64*. This passes BigCrunch tests.
-*/
-static inline uint32_t  prng_u32(void)
-{
-  uint64_t  x = prng_state;
-  x ^= x >> 12;
-  x ^= x << 25;
-  x ^= x >> 27;
-  prng_state = x;
-  return (x * UINT64_C(2685821657736338717)) >> 32;
+int elapsed_micros(const struct timeval st) {
+  struct timeval et;
+  gettimeofday(&et, NULL);
+  return (et.tv_sec - st.tv_sec) * MEGA + (et.tv_usec - st.tv_usec);
 }
 
-/* Generate a 64-bit seed for the pseudo-random number generator.
+#define SECONDS(st) (elapsed_micros(st) / (float) MEGA)
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+
+// check errno when return is -1
+int init_uart(int port) {
+  struct termios tty;
+
+  if (tcgetattr(port, &tty) < 0) {
+    return -1;
+  }
+
+  // "raw" mode
+  tty.c_cflag |= (CLOCAL | CREAD); // ignore modem control lines, enable receiver
+  tty.c_cflag &= ~CSIZE;
+  tty.c_cflag |= CS8; // 1 "char" = 8 bits
+  tty.c_cflag &= ~PARENB; // disable bit parity check
+  tty.c_cflag &= ~CSTOPB; // 1 stop bit
+  // tty.c_cflag &= ~CRTSCTS; // disable HW flow control (RTS)
+  tty.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
+  tty.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
+  tty.c_oflag &= ~OPOST; // disable implementation-based output processing
+
+  // blocking reads
+  tty.c_cc[VMIN] = 1;
+  tty.c_cc[VTIME] = 0;
+
+  if (tcsetattr(port, TCSANOW, &tty) < 0) {
+    return -1;
+  }
+
+  /*
+  man page: "tcsetattr() returns success if any of the requested changes could 
+  successfully be carried out...when making multiple changes...follow this call with a
+  further call to tcgetattr to check that all changes have been performed successfully"
+  */
+  if (tcgetattr(port, &tty) < 0) {
+    return -1;
+  }
+
+  return 0;
+}
+
+// if return value is less than 0, check errno
+// https://man7.org/linux/man-pages/man2/ioctl_tty.2.html
+int config_uart_bitrate(int port, int bitrate) {
+  struct termios2 tty;
+
+  // ioctl equivalent to "tc(get/set)attr"
+  if (ioctl(port, TCGETS2, &tty) < 0) {
+    return -1;
+  }
+
+  /*
+  man page: "If...c_cflag contains the flag BOTHER, then the baud rate is
+  stored in the structure members c_ispeed and c_ospeed as integer values"
+  */
+  tty.c_cflag &= ~CBAUD;
+  tty.c_cflag |= BOTHER;
+  tty.c_ispeed = bitrate;
+  tty.c_ospeed = bitrate;
+
+  if (ioctl(port, TCSETS2, &tty) < 0) {
+    return -1;
+  }
+
+  if (ioctl(port, TCGETS2, &tty) < 0) {
+    return -1;
+  }
+
+  return 0;
+}
+
+// create global write buffer pointer so that exit handler can free memory
+unsigned char *write_buffer = NULL;
+
+void cleanup() {
+  printf("cleaning write buffer...\n");
+  free(write_buffer);
+  write_buffer = NULL;
+  exit(EXIT_SUCCESS);
+}
+
+/*
+the state machine
 */
-static uint64_t  prng_seed(void)
-{
-    struct timespec  now, boot;
-    pid_t            pid;
-    uint64_t         seed;
+typedef enum {
+  CMD_DATA_REQUEST    = 0x00ff,
+  CMD_KINEMATIC_STATE = 0x0001,
+  CMD_ROBOT_STATE     = 0x0002,
+  CMD_CLIENT_DRAW     = 0x0003,
+  CMD_ESTIMATOR_STATE = 0x0101,
+  CMD_MOTOR_FEEDBACK  = 0x0102,
+  CMD_DR16            = 0x0103,
+  CMD_REV_ENCODER     = 0x0104,
+  CMD_ISM             = 0x0105,
+  CMD_REF_SYS         = 0x0107
+} UartCmdId;
 
-    pid = getpid();
+const UartCmdId NORM_CMD[] = { 
+  CMD_DATA_REQUEST,
+  CMD_KINEMATIC_STATE,
+  CMD_ROBOT_STATE,
+  CMD_CLIENT_DRAW,
+  CMD_ESTIMATOR_STATE,
+  CMD_MOTOR_FEEDBACK,
+  CMD_DR16,
+  CMD_REV_ENCODER,
+  CMD_ISM,
+  CMD_REF_SYS
+};
 
-    do {
-        clock_gettime(CLOCK_REALTIME, &now);
-        clock_gettime(CLOCK_BOOTTIME, &boot);
+const int RESPONSE_SIZE_LOOKUP[] = {
+  0, // DATA_REQUEST
+  0, // KINEMATIC_STATE
+  0, // ROBOT_STATE
+  0, // CLIENT_DRAW
+  0, // ESTIMATOR_STATE
+  0, // MOTOR_FEEDBACK
+  28, // DR16
+  0, // REV_ENCODER
+  0, // ISM
+  0 // REF_SYS
+};
 
-        seed = (uint64_t)pid * UINT64_C(21272683)
-             + (uint64_t)now.tv_sec * UINT64_C(113090255381)
-             + (uint64_t)now.tv_nsec * UINT64_C(2470424306258081)
-             + (uint64_t)boot.tv_sec * UINT64_C(9526198845596401)
-             + (uint64_t)boot.tv_nsec * UINT64_C(9454161880954729);
-    } while (!seed);
+typedef enum {
+  SCAN_MAGIC,
+  SCAN_LENGTH,
+  SCAN_SEQ,
+  SCAN_CRC8,
+  SCAN_CMD_ID,
+  SCAN_DATA,
+  SCAN_CRC16,
+} UartState;
 
-    prng_state = seed;
-    return seed;
+typedef struct {
+  uint16_t length;
+  uint8_t seq;
+  uint8_t crc8, calc_crc8;
+  uint16_t cmd_id;
+  uint8_t data[MAX_DATA_SIZE];
+  uint16_t crc16, calc_crc16;
+} UartRawPacket;
+
+typedef struct {
+  int counter;
+  UartRawPacket packet;
+  UartState state;
+} UartFsm;
+
+void fsm_init(UartFsm *fsm) {
+  fsm->state = SCAN_MAGIC;
 }
 
-/* When 'done' becomes nonzero, it is time to stop the measurement.
-*/
-static volatile sig_atomic_t  done = 0;
-
-/* Signal handler for 'done'.
-*/
-static void handle_done(int signum)
-{
-    // Silence unused variable warning; generates no code.
-    (void)signum;
-
-    done = 1;
+void reset_crc8(uint8_t *crc8) {
+  *crc8 = 0xff;
 }
 
-static int install_done(int signum)
-{
-    struct sigaction  act;
-    memset(&act, 0, sizeof act);
-    sigemptyset(&act.sa_mask);
-    act.sa_handler = handle_done;
-    act.sa_flags = 0;  // Specifically, NO SA_RESTART flag.
-    return sigaction(signum, &act, NULL);
+void reset_crc16(uint16_t *crc16) {
+  *crc16 = 0xffff;
 }
 
-/* One-second interval timer.  Simply sets 'update' to nonzero.
-*/
-#ifndef  UPDATE_SIGNAL
-#define  UPDATE_SIGNAL  (SIGRTMIN+0)
-#endif
+void cycle_crc8(uint8_t *crc8, const uint8_t next_byte) {}
+void cycle_crc16(uint16_t *crc16, const uint8_t next_byte) {}
 
-static timer_t                update_timer;
-static volatile sig_atomic_t  update = 0;
+void fsm_cycle(UartFsm *fsm, uint8_t byte) {
+  switch (fsm->state) {
+    case SCAN_MAGIC:
+      if (byte == MAGIC) {
+        // reset checksums
+        reset_crc8(&fsm->packet.calc_crc8);
+        reset_crc16(&fsm->packet.calc_crc16);
 
-static void handle_update(int signum)
-{
-    (void)signum;
-    update = 1;
-}
+        fsm->packet.length = 0;
+        fsm->packet.cmd_id = 0;
+        fsm->packet.crc16 = 0;
 
-static int install_update(void)
-{
-    struct itimerspec spec;
-    struct sigevent   ev;
-    struct sigaction  act;
+        fsm->counter = 0;
+        fsm->state = SCAN_LENGTH;
+      }
+      break;
 
-    memset(&act, 0, sizeof act);
-    sigemptyset(&act.sa_mask);
-    act.sa_handler = handle_update;
-    act.sa_flags = SA_RESTART;
-    if (sigaction(UPDATE_SIGNAL, &act, NULL) == -1)
-        return -1;
+    case SCAN_LENGTH:
+      fsm->packet.length |= byte << (fsm->counter++ * 8);
+      if (fsm->counter == 2) {
+        printf("%d\n", fsm->packet.length);
+        fsm->state = SCAN_SEQ;
+      }
+      break;
 
-    ev.sigev_notify = SIGEV_SIGNAL;
-    ev.sigev_signo  = UPDATE_SIGNAL;
-    ev.sigev_value.sival_ptr = NULL;
-    if (timer_create(CLOCK_BOOTTIME, &ev, &update_timer) == -1)
-        return -1;
+    case SCAN_SEQ:
+      fsm->packet.seq = byte;
+      fsm->state = SCAN_CRC8;
+      break;
 
-    spec.it_value.tv_sec = 1;       // One second to first update
-    spec.it_value.tv_nsec = 0;
-    spec.it_interval.tv_sec = 1;    // Repeat at one second intervals
-    spec.it_interval.tv_nsec = 0;
-    if (timer_settime(update_timer, 0, &spec, NULL) == -1)
-        return -1;
+    case SCAN_CRC8:
+      fsm->packet.crc8 = byte;
+      fsm->counter = 0;
+      fsm->state = SCAN_CMD_ID;
 
-    return 0;
-}
+      #ifdef CRC_CHECK
+      if (fsm->packet.calc_crc8 != byte) {
+        fsm->state = SCAN_MAGIC;
+      }
+      #endif // CRC_CHECK
 
-/* USB serial port device handling.
-*/
-static struct termios   tty_settings;
-static int              tty_descriptor = -1;
-static const char      *tty_path = NULL;
+      break;
 
-static void tty_cleanup(void)
-{
-    if (tty_descriptor != -1) {
-        if (tcsetattr(tty_descriptor, TCSANOW, &tty_settings) == -1)
-            fprintf(stderr, "Warning: %s: Cannot reset original termios settings: %s.\n", tty_path, strerror(errno));
+    case SCAN_CMD_ID:
+      fsm->packet.cmd_id |= byte << (fsm->counter++ * 8);
+      if (fsm->counter == 2) {
+        fsm->counter = 0;
+        fsm->state = SCAN_DATA;
+      }
+      break;
 
-        tcflush(tty_descriptor, TCIOFLUSH);
+    case SCAN_DATA:
+      fsm->packet.data[fsm->counter++] = byte;
+      if (fsm->counter == fsm->packet.length) {
+        fsm->counter = 0;
+        fsm->state = SCAN_CRC16;
+      }
+      break;
 
-        if (close(tty_descriptor) == -1)
-            fprintf(stderr, "Warning: %s: Error closing device: %s.\n", tty_path, strerror(errno));
-
-        tty_descriptor = -1;
-    }
-}
-
-static int tty_open(const char *path)
-{
-    struct termios  raw;
-    int             fd;
-
-    // NULL or empty path is invalid, and yields "no such file or directory" error.
-    if (!path || !*path) {
-        errno = ENOENT;
-        return -1;
-    }
-
-    // Fail if tty is already open.
-    if (tty_descriptor != -1) {
-        errno = EALREADY;
-        return -1;
-    }
-
-    // Open the tty device.
-    do {
-        fd = open(path, O_RDWR | O_NOCTTY | O_CLOEXEC);
-    } while (fd == -1 && errno == EINTR);
-    if (fd == -1)
-        return -1;
-
-    // Set exclusive mode, so that others cannot open the device while we have it open.
-    if (ioctl(fd, TIOCEXCL) == -1)
-        fprintf(stderr, "Warning: %s: Cannot get exclusive access on tty device: %s.\n", path, strerror(errno));
-
-    // Drop any already pending data.
-    tcflush(fd, TCIOFLUSH);
-
-    // Obtain current termios settings.
-    if (tcgetattr(fd, &raw) == -1 || tcgetattr(fd, &tty_settings) == -1) {
-        fprintf(stderr, "%s: Cannot get termios settings: %s.\n", path, strerror(errno));
-        close(fd);
-        errno = 0; // Already reported
-        return -1;
-    }
-
-    // Raw 8-bit mode: no post-processing or special characters, 8-bit data.
-    raw.c_iflag &= ~( IGNBRK | BRKINT | PARMRK | INPCK | ISTRIP | INLCR | IGNCR | ICRNL | IXON | IUCLC | IUTF8 );
-    raw.c_oflag &= ~( OPOST );
-    raw.c_lflag &= ~( ECHO | ECHONL | ICANON | ISIG | IEXTEN );
-    raw.c_cflag &= ~( CSIZE | PARENB | CLOCAL );
-    raw.c_cflag |= CS8 | CREAD | HUPCL;
-    // Blocking reads.
-    raw.c_cc[VMIN] = 1;
-    raw.c_cc[VTIME] = 0;
-    if (tcsetattr(fd, TCSANOW, &raw) == -1) {
-        fprintf(stderr, "%s: Cannot set termios settings: %s.\n", path, strerror(errno));
-        close(fd);
-        errno = 0; // Already reported
-        return -1;
-    }
-
-    // Drop any already pending data, again.  Just to make sure.
-    tcflush(fd, TCIOFLUSH);
-
-    // Everything seems to be in order.  Update state for tty_cleanup(), and return success.
-    tty_descriptor = fd;
-    tty_path = path;
-    return 0;
-}
-
-static inline double  seconds_between(const struct timespec after, const struct timespec before)
-{
-    return (double)(after.tv_sec - before.tv_sec)
-         + (double)(after.tv_nsec - before.tv_nsec) / 1000000000.0;
-}
-
-int main(int argc, char *argv[])
-{
-    const size_t     buffer_size = BUFFER_SIZE;
-    size_t           buffer_have = 0;
-    unsigned char   *buffer_data = NULL;
-    struct timespec  started, mark;
-    uint64_t         received_before = 0;   // Received till mark
-    uint64_t         received = 0;          // Received after mark
-    uint64_t         sequence = 0;
-    uint64_t         seed;
-
-    if (argc != 2 || !strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")) {
-        const char *arg0 = (argc > 0 && argv && argv[0] && argv[0][0] != '\0') ? argv[0] : "(this)";
-        fprintf(stderr, "\n");
-        fprintf(stderr, "Usage: %s [ -h | --help ]\n", arg0);
-        fprintf(stderr, "       %s DEVICE\n", arg0);
-        fprintf(stderr, "\n");
-        fprintf(stderr, "This writes a 64-bit XorShift64* seed to DEVICE, then reads the\n");
-        fprintf(stderr, "sequence of the generated numbers, 32 high bits each, verifying\n");
-        fprintf(stderr, "and reporting the transfer rate.  Press CTRL+C or send SIGHUP,\n");
-        fprintf(stderr, "SIGINT, or SIGTERM signal to exit.\n");
-        fprintf(stderr, "\n");
-        return (argc == 1 || argc == 2) ? EXIT_SUCCESS : EXIT_FAILURE;
-    }
-
-    if (install_done(SIGHUP) ||
-        install_done(SIGINT) ||
-        install_done(SIGTERM)) {
-        fprintf(stderr, "Cannot install signal handlers: %s.\n", strerror(errno));
-        return EXIT_FAILURE;
-    }
-
-    buffer_data = malloc(buffer_size + 4);
-    if (!buffer_data) {
-        fprintf(stderr, "Not enough memory available for a %zu-byte input buffer.\n", buffer_size);
-        return EXIT_FAILURE;
-    }
-
-    seed = prng_seed();
-
-    if (tty_open(argv[1])) {
-        if (errno)
-            fprintf(stderr, "%s: Cannot open device: %s.\n", argv[1], strerror(errno));
-        return EXIT_FAILURE;
-    }
-
-    {
-        unsigned char  request[8] = {   seed        & 255,
-                                       (seed >>  8) & 255,
-                                       (seed >> 16) & 255,
-                                       (seed >> 24) & 255,
-                                       (seed >> 32) & 255,
-                                       (seed >> 40) & 255,
-                                       (seed >> 48) & 255,
-                                       (seed >> 56) & 255 };
-        const unsigned char *const q = request + 8;
-        const unsigned char       *p = request;
-        ssize_t                    n;
-
-        while (p < q) {
-            n = write(tty_descriptor, p, (size_t)(q - p));
-            if (n > 0) {
-                p += n;
-            } else
-            if (n != -1) {
-                fprintf(stderr, "%s: Invalid write (%zd)\n", tty_path, n);
-                break;
-            } else
-            if (errno != EINTR) {
-                fprintf(stderr, "%s: Write error: %s.\n", tty_path, strerror(errno));
-                break;
-            }
+    case SCAN_CRC16:
+      fsm->packet.crc16 |= byte << (fsm->counter++ * 8);
+      if (fsm->counter == 2) {
+        // print
+        printf(
+          "UartRawPacket\n"
+          "\tlen: %u\n"
+          "\tseq: %u\n"
+          "\tcrc8: %u\n"
+          "\tcmd_id: %#04x\n"
+          "\tcrc16: %u\n",
+          fsm->packet.length,
+          fsm->packet.seq,
+          fsm->packet.crc8,
+          fsm->packet.cmd_id,
+          fsm->packet.crc16
+        );
+        
+        if (fsm->packet.calc_crc16 == fsm->packet.crc16) {
+          // ENQUEUE  
         }
 
-        if (p != q) {
-            tty_cleanup();
-            return EXIT_FAILURE;
-        }
+        fsm->state = SCAN_MAGIC; // find next packet
+      }
+      break;
+  }
+
+  // update checksums
+  if (fsm->state < SCAN_CMD_ID) {
+    cycle_crc8(&fsm->packet.calc_crc8, byte);
+  }
+
+  if (fsm->state < SCAN_CRC16) {
+    cycle_crc16(&fsm->packet.calc_crc16, byte);
+  }
+}
+
+int main(int argc, char **argv) {
+  printf(
+    "stats:\n"
+    "\tfreq: %d\n"
+    "\ttarget (bps): %d (%d byte/s)\n"
+    "\tthrottle limit (byte/s): %d\n",
+    LOOP_FREQ,
+    TARGET_BITRATE,
+    TRANSFER_SPEED_BYTES,
+    BITRATE_THROTTLE_LIMIT
+  );
+
+  // initialize UART port
+  int port = open(argv[1], O_RDWR | O_NOCTTY);
+  fd_set port_set;
+  FD_ZERO(&port_set);
+  FD_SET(port, &port_set);
+
+  if (port < 0) {
+    printf("could not open port \"%s\": %d\n", argv[1], errno);
+    exit(EXIT_FAILURE);
+  }
+
+  if (init_uart(port) < 0) {
+    printf("could not configure UART settings: %d\n", errno);
+    exit(EXIT_FAILURE);
+  }
+
+  if (config_uart_bitrate(port, TARGET_BITRATE) < 0) {
+    printf("could not configure UART bitrate: %d\n", errno);
+    exit(EXIT_FAILURE);
+  }
+
+  // create exit handler to free write buffer
+  struct sigaction act;
+  memset(&act, 0, sizeof(act));
+  act.sa_handler = cleanup;
+  act.sa_flags = 0;
+  if (sigaction(SIGINT, &act, NULL) < 0) {
+    printf("could not configure cleanup handler: %d\n", errno);
+  }
+  
+  // dummy packet
+  unsigned char dummy_packet[] = {
+    MAGIC, // magic
+    6, 0, // length
+    0, // seq
+    1, // crc8
+    10, 0, // cmd_id
+    0, 0, 0, 0, 0, 0, // data 
+    2, 0 // crc16
+  };
+  int packet_len = 15;
+
+  // FSM
+  UartFsm fsm;
+  fsm_init(&fsm);
+  
+  // read and write buffers (max read of 4905 bytes on Linux)
+  unsigned char read_buffer[READ_BUFFER_SIZE];
+  write_buffer = (unsigned char *) calloc(sizeof(unsigned char), BITRATE_THROTTLE_LIMIT);
+  int write_idx = 0;
+
+  // read timeout
+  struct timeval read_timeout;
+  read_timeout.tv_sec = 0;
+  read_timeout.tv_usec = USB_BULK_LATENCY;
+
+  // bitrate statistics
+  int total_sent = 0;
+  int total_recv = 0;
+  
+  // main loop
+  struct timeval prog_st; // program start time
+  gettimeofday(&prog_st, NULL);
+
+  for (int counter = 0; /* loop forever */; counter++) {
+    struct timeval st; // cycle start time
+    gettimeofday(&st, NULL);
+
+    write_idx = 0; // reset write index
+    int num_packets = BITRATE_THROTTLE_LIMIT / packet_len; // throttle the serial port bitrate
+    // int expected_response_size = 
+
+    for (int i = 0; i < num_packets; i++) {
+      // copy dummy packet into write buffer
+      for (int j = 0; j < packet_len; j++) {
+        write_buffer[write_idx++] = dummy_packet[j];
+      }
     }
 
-    if (install_update()) {
-        fprintf(stderr, "Cannot create a periodic update signal: %s.\n", strerror(errno));
-        tty_cleanup();
-        return EXIT_FAILURE;
+    // push to USB driver
+    ssize_t num_written = write(port, write_buffer, write_idx);
+    if (num_written < 0) {
+      printf("could not write to serial port: %d\n", errno);
+      exit(EXIT_FAILURE);
+    }
+    printf("np: %d, wi: %d, #w: %ld\n", num_packets, write_idx, num_written);
+
+    // a specified payload is expected in response, so read until it is received
+    int num_recv = 0;
+    while (num_recv < num_written) {
+      #define READ_TIMEOUT_ABORT_LOSS
+      #ifdef READ_TIMEOUT_ABORT_LOSS
+
+      /*
+      man page (https://man7.org/linux/man-pages/man2/select.2.html)
+      nfds "...should be set to the highest-numbered file descriptor
+      in any of the three sets, plus 1"
+      */
+
+      // give sys call enough time to read data (account USB bulk transfer latency... ~10-20ms)
+      int result = select(port + 1, &port_set, NULL, NULL, &read_timeout);
+      
+      // must reset timeout after select call
+      FD_ZERO(&port_set);
+      FD_SET(port, &port_set);
+      read_timeout.tv_sec = 0;
+      read_timeout.tv_usec = USB_BULK_LATENCY; // needs tweaking
+
+      if (result <= 0) {
+        printf("(!) killing read loop...\n");
+        break;
+      }
+
+      #endif // READ_TIMEOUT_ABORT_LOSS
+
+      // we want to read however many bytes that have been sent that have not been read back again
+      int read_count = read(port, read_buffer, MIN(READ_BUFFER_SIZE, num_written - num_recv));
+
+      if (read_count > 0) {
+        num_recv += read_count;
+
+        for (int i = 0; i < read_count; i++) {
+          fsm_cycle(&fsm, read_buffer[i]);
+        }
+      } else {
+        printf("could not read serial port: %d\n", errno);
+        exit(EXIT_FAILURE);
+      }
     }
 
-    if (clock_gettime(CLOCK_BOOTTIME, &started) == -1) {
-        fprintf(stderr, "Cannot read BOOTTIME clock: %s.\n", strerror(errno));
-        tty_cleanup();
-        return EXIT_FAILURE;
-    } else
-        mark = started;
-
-    while (!done) {
-        if (update) {
-            struct timespec  now;
-
-            if (clock_gettime(CLOCK_BOOTTIME, &now) == -1) {
-                fprintf(stderr, "Cannot read BOOTTIME clock: %s.\n", strerror(errno));
-                tty_cleanup();
-                return EXIT_FAILURE;
-            }
-
-            const double  sec_last = seconds_between(now, mark);
-            const double  mib_last = (double)received / (double)(MEGA);
-            const double  sec_total = seconds_between(now, started);
-            const double  mib_total = (double)(received + received_before) / (double)(MEGA);
-
-            if (sec_last > 0.0 && sec_total > 0.0) {
-                printf("%.3f MB in %.0f seconds (%.3f MB/s on average); %.3f MB in last %.3f seconds (%.3f MB/s); %" PRIu64 " numbers verified\n",
-                       mib_total, sec_total, mib_total/sec_total,
-                       mib_last, sec_last, mib_last/sec_last,
-                       sequence);
-                fflush(stdout);
-            }
-
-            received_before += received;
-            received = 0;
-            mark = now;
-            update = 0;
-        }
-
-        // Receive more data?
-        if (buffer_have < buffer_size) {
-            ssize_t  n = read(tty_descriptor, buffer_data + buffer_have, buffer_size - buffer_have);
-            if (n > 0) {
-                buffer_have += n;
-                received += n;
-            } else
-            if (n != -1) {
-                fprintf(stderr, "%s: Unexpected read error (%zd).\n", tty_path, n);
-                tty_cleanup();
-                return EXIT_FAILURE;
-            } else
-            if (errno != EINTR) {
-                fprintf(stderr, "%s: Read error: %s.\n", tty_path, strerror(errno));
-                tty_cleanup();
-                return EXIT_FAILURE;
-            }
-        }
-
-        // Verify all full words thus far received.
-        if (buffer_have > 3) {
-            const unsigned char       *next = buffer_data;
-            const unsigned char *const ends = buffer_data + buffer_have;
-
-            while (next + 4 <= ends) {
-                uint32_t  u =  (uint32_t)(next[0])
-                            | ((uint32_t)(next[1]) << 8)
-                            | ((uint32_t)(next[2]) << 16)
-                            | ((uint32_t)(next[3]) << 24);
-                if (u == prng_u32()) {
-                    sequence++;
-                    next += 4;
-                } else {
-                    fprintf(stderr, "Data mismatch at %" PRIu64 ". generated number.\n", sequence + 1);
-                    tty_cleanup();
-                    return EXIT_FAILURE;
-                }
-            }
-
-            if (next < ends) {
-                memmove(buffer_data, next, (size_t)(ends - next));
-                buffer_have = (size_t)(ends - next);
-            } else {
-                buffer_have = 0;
-            }
-        }
+    // bitrate metrics
+    total_sent += num_written;
+    total_recv += num_recv;
+    
+    if (counter % 1 == 0) {
+      float elapsed_s = elapsed_micros(prog_st) / MEGA;
+      printf(
+        "THROUGHPUT: %.5fMbps R / %.5fMbps W\n", 
+        (total_recv * 8.0) / MEGA / elapsed_s,
+        (total_sent * 8.0) / MEGA / elapsed_s
+      );
     }
 
-    tty_cleanup();
-    return EXIT_SUCCESS;
+    // maintain consistent loop frequency
+    while (elapsed_micros(st) < CYCLE_TIME_MICROS) {
+      continue;
+    }
+  }
+
+  return 0;
 }

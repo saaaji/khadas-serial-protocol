@@ -170,6 +170,10 @@ int main(int argc, char **argv) {
     FSM fsm;
     fsm.state = SEEK_SOF;
     fsm.offset = 0;
+
+
+    FILE *logf = fopen("log.txt", "w");
+
     for (int counter = 0;; counter++) {
         struct timeval st;
         gettimeofday(&st, NULL);
@@ -186,6 +190,7 @@ int main(int argc, char **argv) {
 
         int recv = 0;
         while (recv < num_written) {
+            // break;
             int res = read(port, read_buffer, MIN(read_buffer_size, num_written - recv));
             if (res > 0) {
                 recv += res;
@@ -210,10 +215,14 @@ int main(int argc, char **argv) {
         total_sent += num_written;
         total_recv += recv;
         
-        float elapsed_s = elapsed_micros(prog_st) / MEGA;
-        printf("THROUGHPUT: %.2fMbps R / %.2fMbps W\n", 
-            (total_recv * 8.0) / MEGA / elapsed_s,
-            (total_sent * 8.0) / MEGA / elapsed_s);
+        if (counter % 100 == 0) {
+          float elapsed_s = elapsed_micros(prog_st) / (float) MEGA;
+          fprintf(logf, "%0.2f\t%0.2f\t%0.2f\n",
+              elapsed_s,
+              (total_recv * 8.0) / MEGA / elapsed_s,
+              (total_sent * 8.0) / MEGA / elapsed_s);
+          // if (elapsed_s > 10.0) break;
+        }
 
         while (elapsed_micros(st) < cycle_time_micros) {
             continue;
