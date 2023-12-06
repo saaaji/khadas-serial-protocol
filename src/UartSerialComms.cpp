@@ -1,3 +1,5 @@
+#include "UartSerialComms.hpp"
+
 /**
 * UartPacketData
 */
@@ -9,7 +11,7 @@ int UartPacketData::calc_data_response_size(UartPacketData::CmdId cmd_id) {
   return 0;
 }
 
-UartPacketData UartPacketData::from_raw(const UartRawPacket& raw, uint8_t seq) {
+UartPacketData UartPacketData::from_raw(const UartRawPacket& raw) {
   UartPacketData data;
   int read_idx = 0;
 
@@ -22,7 +24,7 @@ UartPacketData UartPacketData::from_raw(const UartRawPacket& raw, uint8_t seq) {
 
   switch (data.cmd_id) {
     case UartPacketData::REV_ENCODER:
-      bitcaster.u32 = decode<uint32_t>(raw.data, read_idx);
+      bitcaster.u32 = UartUtil::decode<uint32_t>(raw.body, read_idx);
       data.rev_encoder.angle = bitcaster.f32;
       break;
   }
@@ -39,7 +41,8 @@ uint8_t UartRawPacket::reset_crc8() {
 }
 
 uint8_t UartRawPacket::cycle_crc8(const uint8_t& byte) {
-  // TODO: crc8
+  uint8_t n = calc_crc8 ^ byte;
+  calc_crc8 = CRC8_LOOKUP[n];
   return calc_crc8;
 }
 
@@ -49,7 +52,7 @@ uint16_t UartRawPacket::reset_crc16() {
 }
 
 uint16_t UartRawPacket::cycle_crc16(const uint8_t& byte) {
-  // TODO: crc16
+  calc_crc16 = (calc_crc16 >> 8) ^ CRC16_LOOKUP[(calc_crc16 ^ static_cast<uint16_t>(byte)) & 0x00ff];
   return calc_crc16;
 }
 
@@ -60,6 +63,8 @@ void UartRawPacket::clear() {
   length = 0;
   cmd_id = 0;
   crc16 = 0;
+
+  body = &bytes[7];
 }
 
 UartRawPacket UartRawPacket::from_data(const UartPacketData& data, const uint8_t& seq) {
@@ -70,17 +75,17 @@ UartRawPacket UartRawPacket::from_data(const UartPacketData& data, const uint8_t
   raw.cmd_id = static_cast<uint16_t>(data.cmd_id);
   raw.length = UartPacketData::calc_data_response_size(data.cmd_id);
 
-  encode<uint8_t>(raw.bytes, write_idx, UartFsm::MAGIC);
-  encode<uint16_t>(raw.bytes, write_idx, raw.length);
-  encode<uint8_t>(raw.bytes, write_idx, seq);
+  UartUtil::encode<uint8_t>(raw.bytes, write_idx, UartFsm::MAGIC);
+  UartUtil::encode<uint16_t>(raw.bytes, write_idx, raw.length);
+  UartUtil::encode<uint8_t>(raw.bytes, write_idx, seq);
 
   raw.reset_crc8();
   for (int i = 0; i < 4; i++) {
     raw.cycle_crc8(raw.bytes[i]);
   }
 
-  encode<uint8_t>(raw.bytes, write_idx, raw.calc_crc8);
-  encode<uint16_t>(raw.bytes, write_idx, raw.cmd_id);
+  UartUtil::encode<uint8_t>(raw.bytes, write_idx, raw.calc_crc8);
+  UartUtil::encode<uint16_t>(raw.bytes, write_idx, raw.cmd_id);
 
   union {
     uint32_t u32;
@@ -90,7 +95,7 @@ UartRawPacket UartRawPacket::from_data(const UartPacketData& data, const uint8_t
   switch (data.cmd_id) {
     case UartPacketData::REV_ENCODER:
       bitcaster.f32 = data.rev_encoder.angle;
-      encode<uint32_t>(raw.bytes, write_idx, bitcaster.u32);
+      UartUtil::encode<uint32_t>(raw.bytes, write_idx, bitcaster.u32);
       break;
   }
 
@@ -99,12 +104,12 @@ UartRawPacket UartRawPacket::from_data(const UartPacketData& data, const uint8_t
     raw.cycle_crc16(raw.bytes[i]);
   }
 
-  encode<uint16_t>(raw.bytes, write_idx, raw.calc_crc16);
+  UartUtil::encode<uint16_t>(raw.bytes, write_idx, raw.calc_crc16);
   return raw;
 }
 
 int UartRawPacket::get_size() {
-  return 7 + length;
+  return 9 + length;
 }
 
 /**
@@ -125,7 +130,7 @@ bool UartFsm::cycle(const uint8_t& byte) {
       break;
 
     case UartFsm::SCAN_LENGTH:
-      append_byte_le(packet_state.length, counter, byte);
+      UartUtil::append_byte_le(packet_state.length, counter, byte);
       if (counter == 2) {
         read_state = UartFsm::SCAN_SEQ;
       }
@@ -139,7 +144,7 @@ bool UartFsm::cycle(const uint8_t& byte) {
     case UartFsm::SCAN_CRC8:
       packet_state.crc8 = byte;
       counter = 0;
-      state = UartFsm::SCAN_CMD_ID;
+      read_state = UartFsm::SCAN_CMD_ID;
 
     #ifdef ENABLE_CRC_CHECK
       if (packet_state.calc_crc8 != byte) {
@@ -150,7 +155,7 @@ bool UartFsm::cycle(const uint8_t& byte) {
       break;
 
     case UartFsm::SCAN_CMD_ID:
-      append_byte_le(packet_state.cmd_id, counter, byte);
+      UartUtil::append_byte_le(packet_state.cmd_id, counter, byte);
       if (counter == 2) {
         counter = 0;
         read_state = UartFsm::SCAN_DATA;
@@ -158,7 +163,7 @@ bool UartFsm::cycle(const uint8_t& byte) {
       break;
     
     case UartFsm::SCAN_DATA:
-      packet_state.data[counter++] = byte;
+      packet_state.body[counter++] = byte;
       if (counter == packet_state.length) {
         counter = 0;
         read_state = UartFsm::SCAN_CRC16;
@@ -166,9 +171,10 @@ bool UartFsm::cycle(const uint8_t& byte) {
       break;
 
     case UartFsm::SCAN_CRC16:
-      append_byte_le(packet_state.crc16, counter, byte);
+      UartUtil::append_byte_le(packet_state.crc16, counter, byte);
       if (counter == 2) {
-      
+        read_state = UartFsm::SCAN_MAGIC;
+
       #ifdef ENABLE_CRC_CHECK
         if (packet_state.calc_crc16 == packet_state.crc16) {
           return true;
@@ -182,11 +188,11 @@ bool UartFsm::cycle(const uint8_t& byte) {
   }
 
   if (read_state < UartFsm::SCAN_CMD_ID) {
-    packet_state.cycle_crc8();
+    packet_state.cycle_crc8(byte);
   }
 
   if (read_state < UartFsm::SCAN_CRC16) {
-    packet_state.cycle_crc16();
+    packet_state.cycle_crc16(byte);
   }
 
   return false;
@@ -216,7 +222,7 @@ UartSerialComms::UartSerialComms(const char *_port_name, int bitrate, int _loop_
   FD_SET(port, &port_set);
 
   struct termios tty;
-  struct termios2 tty;
+  struct termios2 tty2;
 
   assert(tcgetattr(port, &tty) >= 0);
 
@@ -245,24 +251,26 @@ UartSerialComms::UartSerialComms(const char *_port_name, int bitrate, int _loop_
   assert(tcgetattr(port, &tty) >= 0);
 
   // ioctl equivalent to "tc(get/set)attr"
-  assert(ioctl(port, TCGETS2, &tty) >= 0);
+  assert(ioctl(port, TCGETS2, &tty2) >= 0);
 
   /*
   man page: "If...c_cflag contains the flag BOTHER, then the baud rate is
   stored in the structure members c_ispeed and c_ospeed as integer values"
   */
-  tty.c_cflag &= ~CBAUD;
-  tty.c_cflag |= BOTHER;
-  tty.c_ispeed = bitrate;
-  tty.c_ospeed = bitrate;
+  tty2.c_cflag &= ~CBAUD;
+  tty2.c_cflag |= BOTHER;
+  tty2.c_ispeed = bitrate;
+  tty2.c_ospeed = bitrate;
 
-  assert(ioctl(port, TCSETS2, &tty) >= 0);
-  assert(ioctl(port, TCGETS2, &tty) >= 0);
+  assert(ioctl(port, TCSETS2, &tty2) >= 0);
+  assert(ioctl(port, TCGETS2, &tty2) >= 0);
 
   // ALLOC
   write_buffer = new unsigned char[throttle_limit_bytes];
   write_idx = 0;
   seq = 0;
+
+  stats.total_recv = stats.total_sent = 0;
 }
 
 UartSerialComms::~UartSerialComms() {
@@ -276,17 +284,67 @@ bool UartSerialComms::write_packet(UartRawPacket packet) {
   }
 #endif
 
-  std::memcpy(write_buffer, packet.bytes, packet.get_size());
+  std::memcpy(write_buffer + write_idx, packet.bytes, packet.get_size());
   write_idx += packet.get_size();
   return true;
 }
 
 void UartSerialComms::handle_cycle_io() {
-  // TODO
+  // flush write queue
+  int bytes_remaining = throttle_limit_bytes;
+  int expected_response_size = 0;
+
+  write_idx = 0;
+  while (!to_write.empty()) {
+    UartRawPacket raw = to_write.front();
+    if (bytes_remaining >= raw.get_size()) {
+      write_packet(raw);
+      bytes_remaining -= raw.get_size();
+      expected_response_size += raw.get_size();
+      to_write.pop();
+    } else break;
+  }
+
+  ssize_t num_written = write(port, write_buffer, write_idx);
+
+  // read
+  int bytes_recv = 0;
+  while (bytes_recv < expected_response_size) {
+ 
+  #ifdef ENABLE_UART_READ_TIMEOUT
+    FD_ZERO(&port_set);
+    FD_SET(port, &port_set);
+    read_timeout.tv_sec = 0;
+    read_timeout.tv_usec = USB_BULK_LATENCY;
+
+    int result = select(port + 1, &port_set, NULL, NULL, &read_timeout);
+  
+    if (result <= 0) {
+      break;
+    }
+  #endif
+
+    int read_count = read(port, read_buffer, MIN(READ_BUFFER_SIZE, expected_response_size - bytes_recv));
+    if (read_count > 0) {
+      bytes_recv += read_count;
+      for (int i = 0; i < read_count; i++) {
+        if (fsm.cycle(read_buffer[i])) {
+          to_read.push(fsm.get_state());
+        }
+      }
+    } else break;
+  }
+
+  stats.total_sent += num_written;
+  stats.total_recv += bytes_recv;
+}
+
+int UartSerialComms::reqs_in_queue() {
+  return to_write.size();
 }
 
 void UartSerialComms::send(const UartPacketData& packet) {
-  UartRawPacket raw = UartRawPacket::from_data(packet);
+  UartRawPacket raw = UartRawPacket::from_data(packet, static_cast<uint8_t>(seq++ % 255));
   to_write.push(raw);
 }
 
