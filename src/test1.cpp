@@ -31,18 +31,21 @@ int elapsed_micros(const struct timeval st) {
 }
 
 int main() {
-  UartSerialComms comms("/dev/ttyACM0", TARGET_BITRATE, LOOP_FREQ);
+  UartSerialHost host("/dev/ttyACM0", TARGET_BITRATE, LOOP_FREQ);
 
   UartPacketData dst;
   UartPacketData test;
-  test.cmd_id = UartPacketData::REV_ENCODER;
-  test.rev_encoder.angle = 3.14159;
+  test.cmd_id = UartPacketData::DATA_REQUEST;
+  test.req.cmd_id = static_cast<uint16_t>(UartPacketData::REV_ENCODER);
+  test.req.sensor_id = 1;
+
+  int z = 1000000;
   
-  for (int i = 0; i < 500000; i++) {
-    comms.send(test);
+  for (int i = 0; i < z; i++) {
+    host.send(test);
   }
 
-  printf("WAITING: %d\n", comms.reqs_in_queue());
+  printf("waiting on %d packets...\n", host.reqs_in_queue());
 
   struct timeval prog_st; // program start time
   gettimeofday(&prog_st, NULL);
@@ -52,12 +55,13 @@ int main() {
     struct timeval st; // cycle start time
     gettimeofday(&st, NULL);
 
-    comms.handle_cycle_io();
-    while (comms.recv(dst)) {
+    host.handle_cycle_io();
+    while (host.recv(dst)) {
+      // printf("ANG: %f\n", dst.rev_encoder.angle);
       recv++;
     }
 
-    if (comms.reqs_in_queue() == 0) break;
+    if (host.reqs_in_queue() == 0) break;
 
     // maintain consistent loop frequency
     while (elapsed_micros(st) < CYCLE_TIME_MICROS) {
@@ -65,6 +69,11 @@ int main() {
     }
   }
 
-  printf("G: %f\n", elapsed_micros(prog_st) / (float)MEGA);
-  printf("r: %d / %d\n", comms.stats.total_recv, comms.stats.total_sent);
+  float elapsed_s = elapsed_micros(prog_st) / (float) MEGA;
+  printf("transfer time: %f\n", elapsed_s);
+  printf("bitrate (R/W, Mbps): %0.2f\t%0.2f\n",
+              (host.stats.total_recv * 8.0) / MEGA / elapsed_s,
+              (host.stats.total_sent * 8.0) / MEGA / elapsed_s);
+  printf("packets sent/recv: %d / %d\n", z, recv);
+  printf("bytes sent/recv: %d / %d\n", host.stats.total_sent, host.stats.total_recv);
 }

@@ -1,6 +1,9 @@
 #ifndef UART_SERIAL_COMMS
 #define UART_SERIAL_COMMS
 
+//temp
+#include <cstdio>
+
 #if defined(__linux__)
 #define UART_LINUX_DETECTED
 #endif
@@ -97,7 +100,7 @@ namespace UartUtil {
       return data[offset];
     }
 
-    for (int i = 0; i < n; i++) {
+    for (size_t i = 0; i < n; i++) {
       uint8_t byte = data[offset + i];
       res |= (byte << i * 8);
     }
@@ -113,7 +116,7 @@ namespace UartUtil {
       return;
     }
 
-    for (int i = 0; i < n; i++) {
+    for (size_t i = 0; i < n; i++) {
       unsigned char byte = (val >> i * 8) & 0xff;
       data[write_idx++] = byte;
     }
@@ -133,12 +136,21 @@ struct UartPacketData {
   CmdId cmd_id;
   union {
     struct {
+      uint8_t sensor_id;
+      uint16_t cmd_id;
+    } req;
+
+    struct {
+      uint8_t sensor_id;
       float angle;
     } rev_encoder;
+
     // ...
   };
 
-  static int calc_data_response_size(CmdId cmd_id);
+  int calc_response_size();
+
+  static int calc_body_size(CmdId cmd_id);
   static UartPacketData from_raw(const UartRawPacket& raw);
 };
 
@@ -186,7 +198,12 @@ class UartFsm {
     UartRawPacket get_state();
 };
 
-class UartSerialComms {
+/**
+* implement host/client interface depending on platform
+*/
+#ifdef UART_LINUX_DETECTED 
+
+class UartSerialHost {
   private:
     static const int USB_BULK_LATENCY = 15000; // micros
     static const int READ_BUFFER_SIZE = 4095; // bytes
@@ -197,6 +214,7 @@ class UartSerialComms {
     fd_set port_set;
 
     int loop_freq;
+    int cycle_time_micros;
     int transfer_rate_bps, transfer_rate_bytes, throttle_limit_bytes;
 
     struct timeval read_timeout;
@@ -208,9 +226,9 @@ class UartSerialComms {
     UartFsm fsm;
 
     // API
-    int seq;
+    unsigned int seq;
     std::queue<UartRawPacket> to_read;
-    std::queue<UartRawPacket> to_write;
+    std::queue<UartPacketData> to_write;
 
     bool write_packet(UartRawPacket packet);
 
@@ -219,13 +237,40 @@ class UartSerialComms {
       int total_recv, total_sent;
     } stats;
 
-    UartSerialComms(const char *_port_name, int bitrate, int _loop_freq);
-    ~UartSerialComms();
+    UartSerialHost(const char *_port_name, int bitrate, int _loop_freq);
+    ~UartSerialHost();
 
     int reqs_in_queue();
     void handle_cycle_io();
     void send(const UartPacketData& packet);
     bool recv(UartPacketData& dst);
 };
+
+#else // UART_LINUX_DETECTED
+
+class UartSerialClient {
+  private:
+    static const int READ_BUFFER_SIZE = 512; // max read on Teensy4.1
+    
+    int loop_freq;
+    int cycle_time_micros;
+    int transfer_rate_bps, transfer_rate_bytes, throttle_limit_bytes;
+
+    unsigned char read_buffer[READ_BUFFER_SIZE];
+
+    UartFsm fsm;
+
+    unsigned int seq;
+
+    bool gen_response(UartRawPacket request, UartPacketData& response);
+
+
+  public:
+    UartSerialClient(int bitrate, int _loop_freq);
+
+    void handle_cycle_io();
+};
+
+#endif // UART_LINUX_DETECTED
 
 #endif

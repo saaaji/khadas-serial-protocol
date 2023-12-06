@@ -3,11 +3,28 @@
 /**
 * UartPacketData
 */
-int UartPacketData::calc_data_response_size(UartPacketData::CmdId cmd_id) {
+int UartPacketData::calc_body_size(UartPacketData::CmdId cmd_id) {
   switch (cmd_id) {
+    case DATA_REQUEST:
+      return 3;
+
     case REV_ENCODER:
-      return 4;
+      return 5;
   }
+  return 0;
+}
+
+int UartPacketData::calc_response_size() {
+  switch (cmd_id) {
+    case DATA_REQUEST:
+      UartPacketData::CmdId req_cmd_id = static_cast<UartPacketData::CmdId>(req.cmd_id);
+      switch (req_cmd_id) {
+        case REV_ENCODER:
+          return 9 + UartPacketData::calc_body_size(req_cmd_id);
+      }
+      break;
+  }
+
   return 0;
 }
 
@@ -23,7 +40,13 @@ UartPacketData UartPacketData::from_raw(const UartRawPacket& raw) {
   } bitcaster;
 
   switch (data.cmd_id) {
+    case UartPacketData::DATA_REQUEST:
+      data.req.sensor_id = UartUtil::decode<uint8_t>(raw.body, read_idx);
+      data.req.cmd_id = UartUtil::decode<uint16_t>(raw.body, read_idx);
+      break;
+
     case UartPacketData::REV_ENCODER:
+      data.rev_encoder.sensor_id = UartUtil::decode<uint8_t>(raw.body, read_idx);
       bitcaster.u32 = UartUtil::decode<uint32_t>(raw.body, read_idx);
       data.rev_encoder.angle = bitcaster.f32;
       break;
@@ -73,7 +96,7 @@ UartRawPacket UartRawPacket::from_data(const UartPacketData& data, const uint8_t
   int write_idx = 0;
 
   raw.cmd_id = static_cast<uint16_t>(data.cmd_id);
-  raw.length = UartPacketData::calc_data_response_size(data.cmd_id);
+  raw.length = UartPacketData::calc_body_size(data.cmd_id);
 
   UartUtil::encode<uint8_t>(raw.bytes, write_idx, UartFsm::MAGIC);
   UartUtil::encode<uint16_t>(raw.bytes, write_idx, raw.length);
@@ -119,7 +142,11 @@ UartFsm::UartFsm() {
   read_state = UartFsm::SCAN_MAGIC;
 }
 
+int z;
+uint8_t hist[20];
+
 bool UartFsm::cycle(const uint8_t& byte) {
+  hist[z++ % 20] = byte;
   switch (read_state) {
     case UartFsm::SCAN_MAGIC:
       if (byte == MAGIC) {
@@ -138,6 +165,17 @@ bool UartFsm::cycle(const uint8_t& byte) {
 
     case UartFsm::SCAN_SEQ:
       packet_state.seq = byte;
+      if (packet_state.length != 5) {
+        for (int i = 0; i < 20; i++) {
+          printf("%4d | ", i);
+        }printf("\n");
+        for (int i = 0; i < 20; i++) {
+          printf("%4u | ", hist[i]);
+        }
+        printf("\nZ / l: %d / %u\n", z%20, packet_state.length);
+        // printf("LEN[%u, %d]: %#x\n", byte, gseq, packet_state.length);
+      }
+      // gseq++;
       read_state = UartFsm::SCAN_CRC8;
       break;
 
@@ -203,11 +241,16 @@ UartRawPacket UartFsm::get_state() {
   return packet_state;
 }
 
+
+
 /**
-* UartSerialComms
+* UartSerialHost
 */
-UartSerialComms::UartSerialComms(const char *_port_name, int bitrate, int _loop_freq) {
+#ifdef UART_LINUX_DETECTED
+
+UartSerialHost::UartSerialHost(const char *_port_name, int bitrate, int _loop_freq) {
   loop_freq = _loop_freq;
+  cycle_time_micros = 1000000 / _loop_freq;
   transfer_rate_bps = bitrate;
   transfer_rate_bytes = bitrate / 8;
   throttle_limit_bytes = transfer_rate_bytes / _loop_freq;
@@ -273,11 +316,11 @@ UartSerialComms::UartSerialComms(const char *_port_name, int bitrate, int _loop_
   stats.total_recv = stats.total_sent = 0;
 }
 
-UartSerialComms::~UartSerialComms() {
+UartSerialHost::~UartSerialHost() {
   delete write_buffer;
 }
 
-bool UartSerialComms::write_packet(UartRawPacket packet) {
+bool UartSerialHost::write_packet(UartRawPacket packet) {
 #ifdef ENABLE_SAFE_WRITE
   if (throttle_limit_bytes - write_idx < packet.get_size()) {
     return false;
@@ -289,18 +332,21 @@ bool UartSerialComms::write_packet(UartRawPacket packet) {
   return true;
 }
 
-void UartSerialComms::handle_cycle_io() {
+void UartSerialHost::handle_cycle_io() {
   // flush write queue
   int bytes_remaining = throttle_limit_bytes;
   int expected_response_size = 0;
 
   write_idx = 0;
   while (!to_write.empty()) {
-    UartRawPacket raw = to_write.front();
+    UartPacketData packet = to_write.front();
+    UartRawPacket raw = UartRawPacket::from_data(packet, static_cast<uint8_t>(seq++ % 255));
+    
     if (bytes_remaining >= raw.get_size()) {
-      write_packet(raw);
       bytes_remaining -= raw.get_size();
-      expected_response_size += raw.get_size();
+      expected_response_size += packet.calc_response_size();
+      
+      write_packet(raw);
       to_write.pop();
     } else break;
   }
@@ -339,16 +385,15 @@ void UartSerialComms::handle_cycle_io() {
   stats.total_recv += bytes_recv;
 }
 
-int UartSerialComms::reqs_in_queue() {
+int UartSerialHost::reqs_in_queue() {
   return to_write.size();
 }
 
-void UartSerialComms::send(const UartPacketData& packet) {
-  UartRawPacket raw = UartRawPacket::from_data(packet, static_cast<uint8_t>(seq++ % 255));
-  to_write.push(raw);
+void UartSerialHost::send(const UartPacketData& packet) {
+  to_write.push(packet);
 }
 
-bool UartSerialComms::recv(UartPacketData& dst) {
+bool UartSerialHost::recv(UartPacketData& dst) {
   if (!to_read.empty()) {
     UartRawPacket raw = to_read.front();
     dst = UartPacketData::from_raw(raw);
@@ -357,3 +402,62 @@ bool UartSerialComms::recv(UartPacketData& dst) {
   }
   return false;
 }
+
+#else // UART_LINUX_DETECTED
+
+/**
+* UartSerialClient
+*/
+
+UartSerialClient::UartSerialClient(int bitrate, int _loop_freq) {
+  loop_freq = _loop_freq;
+  cycle_time_micros = 1000000 / _loop_freq;
+  transfer_rate_bps = bitrate;
+  transfer_rate_bytes = bitrate / 8;
+  throttle_limit_bytes = transfer_rate_bytes / _loop_freq;
+
+  Serial.setTimeout(0);
+}
+
+bool UartSerialClient::gen_response(UartRawPacket request, UartPacketData& response) {
+  UartPacketData data = UartPacketData::from_raw(request);
+
+  switch (data.cmd_id) {
+    case UartPacketData::DATA_REQUEST:
+      response.cmd_id = UartPacketData::REV_ENCODER;
+      response.rev_encoder.sensor_id = data.req.sensor_id;
+      response.rev_encoder.angle = 3.14159;
+      return true;
+
+    default:
+      break;
+  }
+
+  return false;
+}
+
+void UartSerialClient::handle_cycle_io() {
+  UartPacketData response;
+  UartRawPacket raw;
+  
+  int bytes_recv = 0;
+  do {
+    int num_read = Serial.readBytes(reinterpret_cast<char*>(read_buffer), READ_BUFFER_SIZE);
+    if (num_read > 0) {
+      bytes_recv += num_read;
+      for (int i = 0; i < num_read; i++) {
+        if (fsm.cycle(read_buffer[i])) {
+          // need to send a response?
+          if (gen_response(fsm.get_state(), response)) {
+            raw = UartRawPacket::from_data(response, static_cast<uint8_t>(seq++ % 255));
+            Serial.write(raw.bytes, raw.get_size());
+          }
+        }
+      }
+    } else {
+      break;
+    }
+  } while (bytes_recv < throttle_limit_bytes);
+}
+
+#endif // UART_LINUX_DETECTED
